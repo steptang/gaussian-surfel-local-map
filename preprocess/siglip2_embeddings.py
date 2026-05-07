@@ -39,6 +39,31 @@ def list_images(input_dir, exts=(".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG
     return files
 
 
+def _pooled_image_features(model, batch):
+    """Return the (B, K_target) pooled, text-aligned image embedding tensor.
+
+    Different transformers versions are inconsistent about what
+    Siglip2Model.get_image_features returns: in some versions it's a
+    torch.Tensor (the post-projection pooled feature), in others it's a
+    BaseModelOutputWithPooling whose .pooler_output is the same thing.
+    Handle both.
+    """
+    out = model.get_image_features(**batch)
+    if isinstance(out, torch.Tensor):
+        return out
+    if hasattr(out, "pooler_output") and out.pooler_output is not None:
+        return out.pooler_output
+    if hasattr(out, "image_embeds") and out.image_embeds is not None:
+        return out.image_embeds
+    if hasattr(out, "last_hidden_state"):
+        # Last-resort fallback: mean-pool patch features. Worse than the
+        # real attention-pool head SigLIP2 uses, but still meaningful.
+        return out.last_hidden_state.mean(dim=1)
+    raise RuntimeError(
+        f"unexpected get_image_features output type: {type(out).__name__}"
+    )
+
+
 def masked_crop(image_np, region_mask, pad=PADDING_PIXELS, fill_value=0):
     """Mask non-region pixels to fill_value, crop to bbox + pad, return PIL.
 
@@ -77,11 +102,11 @@ def main():
     model = AutoModel.from_pretrained(args.variant, torch_dtype=torch.float16).cuda().eval()
     processor = AutoProcessor.from_pretrained(args.variant)
 
-    # K_target = output dim of model.get_image_features. Probe once.
+    # K_target = output dim of the pooled image embedding. Probe once.
     with torch.no_grad():
         probe = Image.new("RGB", (ENCODER_INPUT_SIZE, ENCODER_INPUT_SIZE), (0, 0, 0))
         probe_in = processor(images=[probe], return_tensors="pt").to(model.device)
-        K_target = int(model.get_image_features(**probe_in).shape[-1])
+        K_target = int(_pooled_image_features(model, probe_in).shape[-1])
     print(f"K_target = {K_target}")
 
     images = list_images(args.input_dir)
@@ -120,7 +145,7 @@ def main():
             batch_ids = ids[start:start + args.batch_size]
             inputs = processor(images=batch, return_tensors="pt").to(model.device)
             with torch.no_grad():
-                feats = model.get_image_features(**inputs)         # (B, K_target)
+                feats = _pooled_image_features(model, inputs)      # (B, K_target)
             feats = feats.float().cpu().numpy().astype(np.float16)
             for i, rid in enumerate(batch_ids):
                 embeds[rid] = feats[i]
