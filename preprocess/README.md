@@ -12,18 +12,35 @@ directory and are loaded automatically by `scene/dataset_readers.py` if
 
 ## Stage 1 — SAM3 regions (env A)
 
+SAM3 has no automask "everything" mode — every prediction call needs a
+text concept. The script approximates exhaustive segmentation by running
+SAM3 once per concept in a list (defaulting to COCO-80) and unioning the
+results, then deduplicating overlapping detections by IoU. ~80 SAM3
+forward passes per image at the default settings.
+
 ```bash
 conda activate sam3
+hf auth login                              # SAM3 weights are gated on HF
 python preprocess/sam3_masks.py \
     --input_dir   <scene>/images \
     --output_dir  <scene>/sam3
 ```
 
+Override the concept list with `--concept_list "chair,desk,monitor,..."`
+or `--concepts path/to/concepts.txt` (one per line, `#` for comments).
+Other knobs:
+- `--confidence 0.5` — SAM3 detection threshold
+- `--iou_dedup 0.7` — drop a mask if its IoU with a higher-scored mask
+  exceeds this; relevant when two concepts both fire on the same instance
+  (e.g., "chair" and "furniture")
+- `--overwrite` — re-run on images that already have a regions.png
+
 Per image, produces:
 - `<image_stem>_regions.png` — `(H, W) uint16`, region IDs. 0 = background.
   Stored at the original image resolution. Downsampled with
   nearest-neighbour at training time to match `--resolution`.
-- `<image_stem>_meta.json` — per-region area and SAM3 confidence.
+- `<image_stem>_meta.json` — per-region area, SAM3 confidence, source concept,
+  and the concept list used (so you can audit later why a region got that ID).
 
 ## Stage 2 — SigLIP2 region embeddings (env B)
 

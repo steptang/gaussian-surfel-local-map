@@ -1,14 +1,23 @@
-"""SAM3 automask preprocessing: image -> per-pixel region ID map.
+"""SAM3 region-segmentation preprocessing: image -> per-pixel region ID map.
 
-Run in an env with SAM3 + torch installed. See preprocess/README.md.
+SAM3 is concept-prompted (no automask "everything" mode). To approximate
+exhaustive segmentation, we run SAM3 with `set_text_prompt` once per
+concept in a fixed list; SAM3's exhaustive mode returns all instances of
+the named concept per image. We union the returned masks across concepts,
+deduplicate near-duplicates by IoU, and write a single uint16 region map.
 
 Per image, writes:
   <output_dir>/<image_stem>_regions.png  -- (H, W) uint16, region IDs (0=bg, 1..R)
-  <output_dir>/<image_stem>_meta.json    -- per-region area + SAM3 score
+  <output_dir>/<image_stem>_meta.json    -- per-region area, score, source concept
 
-Region IDs are dense (1..R, no gaps). When SAM3 produces overlapping masks the
-larger-area mask wins per pixel, then smaller masks are layered above (this
-matches LangSplat / Gaussian Grouping conventions).
+Concept list: COCO-80 by default. Override via --concepts <file> (one per
+line) or --concept_list "cls1,cls2,...". For indoor robot navigation, COCO-80
+covers most objects; for finer-grained scenes consider LVIS (~1203 classes,
+~10x slower) or a hand-curated list.
+
+Prerequisites:
+  pip install -e <path-to-sam3-repo>
+  hf auth login                      # SAM3 weights are gated
 """
 
 import argparse
@@ -17,10 +26,26 @@ import os
 from glob import glob
 
 import numpy as np
+import torch
 from PIL import Image
 
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG")
+
+# COCO 80 categories. Reasonable default for natural / indoor scenes.
+COCO_80 = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck",
+    "boat", "traffic light", "fire hydrant", "stop sign", "parking meter", "bench",
+    "bird", "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe",
+    "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
+    "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
+    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl",
+    "banana", "apple", "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza",
+    "donut", "cake", "chair", "couch", "potted plant", "bed", "dining table", "toilet",
+    "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven",
+    "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors",
+    "teddy bear", "hair drier", "toothbrush",
+]
 
 
 def list_images(input_dir):
@@ -31,71 +56,119 @@ def list_images(input_dir):
     return files
 
 
-def build_region_map(masks, H, W, min_area=64):
-    """Stack a list of SAM3 binary masks into a single uint16 ID map.
+def load_concepts(args):
+    """Resolve the concept list from CLI flags. Precedence: file > literal > default."""
+    if args.concepts:
+        with open(args.concepts) as f:
+            return [line.strip() for line in f if line.strip() and not line.startswith("#")]
+    if args.concept_list:
+        return [c.strip() for c in args.concept_list.split(",") if c.strip()]
+    return COCO_80
 
-    Sorted small-to-large so larger masks are written first and small
-    masks overwrite (i.e., small parts are preferred over the big object
-    they sit on). Empty pixels remain 0.
+
+def build_sam3():
+    """Construct SAM3 image model + processor. Lazy import so this module is
+    importable in environments without sam3 installed."""
+    from sam3 import build_sam3_image_model
+    from sam3.model.sam3_image_processor import Sam3Processor
+    import sam3
+    sam3_root = os.path.join(os.path.dirname(sam3.__file__), "..")
+    bpe_path = os.path.join(sam3_root, "assets", "bpe_simple_vocab_16e6.txt.gz")
+    model = build_sam3_image_model(bpe_path=bpe_path)
+    return model, Sam3Processor
+
+
+def _to_bool_mask(mask, H, W):
+    """Coerce SAM3's per-instance mask to a (H, W) bool ndarray."""
+    if isinstance(mask, torch.Tensor):
+        mask = mask.detach().cpu().numpy()
+    mask = np.asarray(mask)
+    # SAM3 may return float probabilities; threshold at 0.5
+    if mask.dtype != bool:
+        mask = mask > 0.5
+    if mask.shape != (H, W):
+        # Some pipelines pad to model resolution; resize via PIL nearest
+        mask = np.array(
+            Image.fromarray(mask.astype(np.uint8)).resize((W, H), Image.NEAREST)
+        ).astype(bool)
+    return mask
+
+
+def collect_concept_masks(processor, inference_state, concepts, image_size, confidence):
+    """Run SAM3 once per concept, return list of (mask, score, concept_name).
+
+    Each entry in the returned list represents a single instance. SAM3's
+    exhaustive mode returns multiple instances per concept when present.
     """
-    keep = []
-    for m in masks:
-        seg = m.get("segmentation") if isinstance(m, dict) else m
-        score = float(m.get("stability_score", m.get("predicted_iou", 1.0))) if isinstance(m, dict) else 1.0
-        if seg is None:
-            continue
-        seg = np.asarray(seg, dtype=bool)
-        area = int(seg.sum())
-        if area < min_area:
-            continue
-        keep.append((area, score, seg))
+    H, W = image_size
+    out = []
+    for c in concepts:
+        processor.reset_all_prompts(inference_state)
+        result = processor.set_text_prompt(state=inference_state, prompt=c)
+        # set_text_prompt returns a dict-like state with masks/boxes/scores;
+        # accept either return-as-dict or stored-on-state APIs.
+        d = result if isinstance(result, dict) else inference_state
+        masks = d.get("masks", [])
+        scores = d.get("scores", [1.0] * len(masks))
+        for m, s in zip(masks, scores):
+            score = float(s.item() if isinstance(s, torch.Tensor) else s)
+            if score < confidence:
+                continue
+            bool_mask = _to_bool_mask(m, H, W)
+            if bool_mask.sum() < 64:
+                continue
+            out.append((bool_mask, score, c))
+    return out
 
-    # Largest first so small masks win the per-pixel write order.
-    keep.sort(key=lambda t: -t[0])
 
+def dedup_masks(masks, iou_threshold=0.7):
+    """Greedy IoU dedup: sort by score desc, keep masks whose IoU with all
+    previously-kept masks is below the threshold. Avoids counting the same
+    region twice when overlapping concepts (e.g., 'chair' and 'furniture')
+    fire on the same instance.
+    """
+    if not masks:
+        return []
+    masks_sorted = sorted(masks, key=lambda t: -t[1])  # by score desc
+    kept = []
+    for m, s, c in masks_sorted:
+        ok = True
+        for km, _, _ in kept:
+            inter = np.logical_and(m, km).sum()
+            union = np.logical_or(m, km).sum()
+            if union > 0 and inter / union > iou_threshold:
+                ok = False
+                break
+        if ok:
+            kept.append((m, s, c))
+    return kept
+
+
+def build_region_map(masks, H, W):
+    """Stack masks into uint16 region IDs. Larger area first so smaller
+    parts overwrite the big object they sit on (e.g., 'wheel' on top of
+    'car'). 0 stays as background.
+    """
+    masks_sorted = sorted(masks, key=lambda t: -t[0].sum())  # largest first
     region_map = np.zeros((H, W), dtype=np.uint16)
     meta = []
-    for i, (area, score, seg) in enumerate(keep, start=1):
+    for i, (m, s, c) in enumerate(masks_sorted, start=1):
         if i >= np.iinfo(np.uint16).max:
             print(f"  warn: >65k regions, dropping the rest")
             break
-        region_map[seg] = i
-        meta.append({"id": int(i), "area": int(area), "score": float(score)})
+        region_map[m] = i
+        meta.append({"id": i, "area": int(m.sum()), "score": s, "concept": c})
     return region_map, meta
-
-
-def load_sam3_automask():
-    """Construct a SAM3 automatic mask generator. Import is lazy so this
-    module can be imported in environments without SAM3 (e.g., for testing).
-
-    Adjust the import / model loading below to match your SAM3 install.
-    The returned object must have a .generate(np.ndarray HxWx3 uint8) ->
-    list[dict|ndarray] interface (compatible with SAM2's
-    SAM2AutomaticMaskGenerator).
-    """
-    try:
-        from sam3 import SAM3AutomaticMaskGenerator, build_sam3
-    except ImportError:
-        from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator as SAM3AutomaticMaskGenerator
-        from sam2.build_sam import build_sam2 as build_sam3
-    import torch
-    ckpt = os.environ.get("SAM3_CHECKPOINT", "checkpoints/sam3_hiera_large.pt")
-    cfg = os.environ.get("SAM3_CONFIG", "sam3_hiera_l.yaml")
-    sam = build_sam3(cfg, ckpt, device="cuda")
-    return SAM3AutomaticMaskGenerator(
-        sam,
-        points_per_side=32,
-        pred_iou_thresh=0.7,
-        stability_score_thresh=0.85,
-        min_mask_region_area=64,
-    )
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input_dir", required=True, help="dir of training images")
     ap.add_argument("--output_dir", required=True, help="dir for *_regions.png")
-    ap.add_argument("--min_area", type=int, default=64, help="drop masks below this pixel area")
+    ap.add_argument("--concepts", default=None, help="path to concept list (one per line)")
+    ap.add_argument("--concept_list", default=None, help="comma-separated concepts; overrides --concepts")
+    ap.add_argument("--confidence", type=float, default=0.5, help="SAM3 detection threshold")
+    ap.add_argument("--iou_dedup", type=float, default=0.7, help="IoU threshold for cross-concept dedup")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
@@ -104,8 +177,12 @@ def main():
     if not images:
         raise SystemExit(f"no images found in {args.input_dir}")
 
-    print(f"loading SAM3...")
-    mask_gen = load_sam3_automask()
+    concepts = load_concepts(args)
+    print(f"using {len(concepts)} concepts (first 5: {concepts[:5]}{'...' if len(concepts)>5 else ''})")
+
+    print("loading SAM3...")
+    model, ProcessorCls = build_sam3()
+    processor = ProcessorCls(model, confidence_threshold=args.confidence)
 
     for path in images:
         stem = os.path.splitext(os.path.basename(path))[0]
@@ -115,16 +192,21 @@ def main():
             print(f"skip {stem} (exists)")
             continue
 
-        img = np.array(Image.open(path).convert("RGB"))
-        H, W = img.shape[:2]
+        image = Image.open(path).convert("RGB")
+        W, H = image.size
+        inference_state = processor.set_image(image)
 
-        masks = mask_gen.generate(img)
-        region_map, meta = build_region_map(masks, H, W, min_area=args.min_area)
+        raw = collect_concept_masks(processor, inference_state, concepts,
+                                     (H, W), confidence=args.confidence)
+        deduped = dedup_masks(raw, iou_threshold=args.iou_dedup)
+        region_map, meta = build_region_map(deduped, H, W)
 
         Image.fromarray(region_map, mode="I;16").save(out_png)
         with open(out_json, "w") as f:
-            json.dump({"H": H, "W": W, "R": len(meta), "regions": meta}, f)
-        print(f"  {stem}: {len(meta)} regions -> {out_png}")
+            json.dump({"H": H, "W": W, "R": len(meta),
+                       "concepts": concepts, "regions": meta}, f)
+        coverage = (region_map > 0).sum() / (H * W)
+        print(f"  {stem}: {len(meta)} regions, {coverage:.1%} pixel coverage -> {out_png}")
 
 
 if __name__ == "__main__":
