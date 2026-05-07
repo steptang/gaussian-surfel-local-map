@@ -30,7 +30,7 @@ from PIL import Image
 # Allow running from repo root without installing as a package.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from arguments import ModelParams, PipelineParams
+from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import render
 from scene import Scene, GaussianModel
 from scene.gaussian_model import SEMANTIC_DIM
@@ -69,7 +69,14 @@ def main():
     parser.add_argument("--out", default="heatmap.png")
     parser.add_argument("--checkpoint", default=None,
                         help="path to chkpnt*.pth produced by train.py; required for the SemanticHead")
-    args = parser.parse_args()
+
+    # Mirror render.py: load training settings (resolution, sh_degree,
+    # K_target, data_device, ...) from <model_path>/cfg_args so the user
+    # only needs to pass -s, -m, --query, etc. Without this, every field
+    # ModelParams declares with sentinel=True comes through as None and
+    # downstream code (camera_utils, gaussian_model, semantic_loss) blows
+    # up with confusing NoneType errors.
+    args = get_combined_args(parser)
 
     dataset = lp.extract(args)
     pipe = pp.extract(args)

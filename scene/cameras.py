@@ -14,6 +14,13 @@ from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
+# Module-level guard so the "Custom device <X> failed" warning fires
+# at most once per process even when hundreds of Cameras are constructed
+# (typical training scenes have 100–500). Stores the value that was
+# rejected so a different bad device down the line still warns.
+_BAD_DEVICE_WARNED = set()
+
+
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
@@ -33,8 +40,10 @@ class Camera(nn.Module):
         try:
             self.data_device = torch.device(data_device)
         except Exception as e:
-            print(e)
-            print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
+            if data_device not in _BAD_DEVICE_WARNED:
+                print(e)
+                print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device")
+                _BAD_DEVICE_WARNED.add(data_device)
             self.data_device = torch.device("cuda")
 
         self.original_image = image.clamp(0.0, 1.0) # move to device at dataloader to reduce VRAM requirement
