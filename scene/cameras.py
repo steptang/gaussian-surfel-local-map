@@ -17,7 +17,8 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
+                 region_map=None, region_embeds=None,
                  ):
         super(Camera, self).__init__()
 
@@ -46,7 +47,15 @@ class Camera(nn.Module):
         else:
             # self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device) # do we need this?
             self.gt_alpha_mask = None
-        
+
+        # Semantic supervision artifacts (optional). Kept on CPU; moved to
+        # GPU lazily at the loss site to avoid pinning VRAM for views that
+        # aren't sampled in this iteration.
+        # region_map:    (1, H, W) int16  -- per-pixel SAM3 region ID, 0 = background
+        # region_embeds: (R+1, K_target)  -- per-region SigLIP2 image embedding
+        self.region_map = region_map
+        self.region_embeds = region_embeds
+
         self.zfar = 100.0
         self.znear = 0.01
 

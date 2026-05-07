@@ -16,11 +16,17 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, render_semantic: bool = True):
     """
-    Render the scene. 
-    
+    Render the scene.
+
     Background tensor (bg_color) must be on GPU!
+
+    When render_semantic is True and the GaussianModel has a populated
+    `_semantic` parameter, the rasterizer produces an additional
+    (FEATURE_DIM, H, W) feature map which is returned in the result dict
+    under "rendered_semantic". Set render_semantic=False to skip the feature
+    accumulator entirely (e.g., during pure novel-view synthesis at deploy).
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -94,7 +100,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
     
-    rendered_image, radii, allmap = rasterizer(
+    extra_features = pc.get_semantic if (render_semantic and pc.get_semantic.numel() > 0) else None
+
+    rendered_image, radii, allmap, rendered_semantic = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -102,7 +110,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         opacities = opacity,
         scales = scales,
         rotations = rotations,
-        cov3D_precomp = cov3D_precomp
+        cov3D_precomp = cov3D_precomp,
+        extra_features = extra_features,
     )
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
@@ -154,5 +163,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'surf_depth': surf_depth,
             'surf_normal': surf_normal,
     })
+
+    # rendered_semantic is (FEATURE_DIM, H, W) when semantic is enabled,
+    # otherwise an empty tensor; downstream loss code handles both cases.
+    rets['rendered_semantic'] = rendered_semantic
 
     return rets

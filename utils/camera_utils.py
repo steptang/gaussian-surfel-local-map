@@ -11,10 +11,35 @@
 
 from scene.cameras import Camera
 import numpy as np
+import torch
+from PIL import Image
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
 
 WARNED = False
+
+
+def _load_region_map(regions_path, resolution):
+    """Load uint16 SAM3 region map and downsample to (W, H) with nearest.
+
+    Returns int16 tensor of shape (1, H, W); int16 is enough for ~32k regions
+    per image and is what cosine_region_loss indexes with.
+    """
+    if regions_path is None:
+        return None
+    img = Image.open(regions_path)
+    if img.size != resolution:
+        img = img.resize(resolution, Image.NEAREST)
+    arr = np.array(img, dtype=np.int32)
+    return torch.from_numpy(arr.astype(np.int16))[None]   # (1, H, W)
+
+
+def _load_region_embeds(embeds_path):
+    """Load (R+1, K_target) float16 embedding table; convert to float32."""
+    if embeds_path is None:
+        return None
+    arr = np.load(embeds_path)
+    return torch.from_numpy(arr.astype(np.float32))
 
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
@@ -39,7 +64,6 @@ def loadCam(args, id, cam_info, resolution_scale):
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
     if len(cam_info.image.split()) > 3:
-        import torch
         resized_image_rgb = torch.cat([PILtoTorch(im, resolution) for im in cam_info.image.split()[:3]], dim=0)
         loaded_mask = PILtoTorch(cam_info.image.split()[3], resolution)
         gt_image = resized_image_rgb
@@ -48,10 +72,14 @@ def loadCam(args, id, cam_info, resolution_scale):
         loaded_mask = None
         gt_image = resized_image_rgb
 
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
+    region_map = _load_region_map(getattr(cam_info, "regions_path", None), resolution)
+    region_embeds = _load_region_embeds(getattr(cam_info, "embeds_path", None))
+
+    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                  region_map=region_map, region_embeds=region_embeds)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

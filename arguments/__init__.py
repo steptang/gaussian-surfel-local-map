@@ -44,7 +44,7 @@ class ParamGroup:
                 setattr(group, arg[0], arg[1])
         return group
 
-class ModelParams(ParamGroup): 
+class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self._source_path = ""
@@ -55,6 +55,16 @@ class ModelParams(ParamGroup):
         self.data_device = "cuda"
         self.eval = False
         self.render_items = ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']
+        # Semantic preprocessing artifacts (SAM3 regions + SigLIP2 region embeddings).
+        # Subdirectory under source_path that holds <image_stem>_regions.png and
+        # <image_stem>_embeds.npy. Empty string disables semantic loading.
+        self.sam_dir = "sam3"
+        # Encoder used to produce embeds.npy. Informational; must match what
+        # preprocess/siglip2_embeddings.py was run with.
+        self.text_encoder_variant = "siglip2-base-patch16-512"
+        # Embedding dimension of embeds.npy. Drives the projection-head output dim.
+        # 768 = siglip2-base, 1024 = siglip2-large, 1152 = siglip2-so400m.
+        self.K_target = 768
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -86,6 +96,16 @@ class OptimizationParams(ParamGroup):
         self.lambda_dist = 0.0
         self.lambda_normal = 0.05
         self.opacity_cull = 0.05
+
+        # Semantic-feature loss. lambda_semantic = 0 disables the loss entirely
+        # (and skips the Camera->loss path); the rasterizer still allocates the
+        # feature stream, but it carries no gradient.
+        self.lambda_semantic = 0.0
+        self.semantic_lr = 0.0025
+        # Resolution of the supervision grid (square). 32 matches SigLIP2 patch
+        # grid at 512 input; rendered semantic map is avg-pooled to this size
+        # and the region map is nearest-pooled to it.
+        self.semantic_grid = 32
 
         self.densification_interval = 100
         self.opacity_reset_interval = 3000

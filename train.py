@@ -13,9 +13,11 @@ import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
+from utils.semantic_loss import SemanticHead, cosine_region_loss
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
+from scene.gaussian_model import SEMANTIC_DIM
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
@@ -34,9 +36,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+
+    # Semantic projection head: maps per-surfel K-dim feature to the
+    # K_target-dim SigLIP2 region-embedding space. Owned by training (not
+    # GaussianModel) because it isn't per-surfel and doesn't need to track
+    # densification/pruning. Optimised with its own Adam group.
+    semantic_head = SemanticHead(SEMANTIC_DIM, dataset.K_target).cuda()
+    semantic_optim = torch.optim.Adam(semantic_head.parameters(), lr=opt.semantic_lr)
+
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, head_state, head_optim_state, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+        if head_state is not None:
+            semantic_head.load_state_dict(head_state)
+            semantic_optim.load_state_dict(head_optim_state)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -48,6 +61,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     ema_dist_for_log = 0.0
     ema_normal_for_log = 0.0
+    ema_semantic_for_log = 0.0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -84,9 +98,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         normal_loss = lambda_normal * (normal_error).mean()
         dist_loss = lambda_dist * (rend_dist).mean()
 
+        # Semantic loss: only when enabled AND when this view has SAM3
+        # preprocessing artifacts. Empty rendered_semantic (numel == 0)
+        # means the rasterizer skipped the feature stream this iteration,
+        # which shouldn't happen mid-run but is guarded here defensively.
+        if (opt.lambda_semantic > 0 and
+                viewpoint_cam.region_map is not None and
+                viewpoint_cam.region_embeds is not None and
+                render_pkg["rendered_semantic"].numel() > 0):
+            sem_loss = cosine_region_loss(
+                render_pkg["rendered_semantic"],
+                viewpoint_cam.region_map.cuda(),
+                viewpoint_cam.region_embeds,
+                semantic_head,
+                grid=opt.semantic_grid,
+            )
+        else:
+            sem_loss = torch.tensor(0.0, device="cuda")
+        semantic_loss_term = opt.lambda_semantic * sem_loss
+
         # loss
-        total_loss = loss + dist_loss + normal_loss
-        
+        total_loss = loss + dist_loss + normal_loss + semantic_loss_term
+
         total_loss.backward()
 
         iter_end.record()
@@ -96,6 +129,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_dist_for_log = 0.4 * dist_loss.item() + 0.6 * ema_dist_for_log
             ema_normal_for_log = 0.4 * normal_loss.item() + 0.6 * ema_normal_for_log
+            ema_semantic_for_log = 0.4 * sem_loss.item() + 0.6 * ema_semantic_for_log
 
 
             if iteration % 10 == 0:
@@ -103,6 +137,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                     "distort": f"{ema_dist_for_log:.{5}f}",
                     "normal": f"{ema_normal_for_log:.{5}f}",
+                    "sem": f"{ema_semantic_for_log:.{5}f}",
                     "Points": f"{len(gaussians.get_xyz)}"
                 }
                 progress_bar.set_postfix(loss_dict)
@@ -115,6 +150,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if tb_writer is not None:
                 tb_writer.add_scalar('train_loss_patches/dist_loss', ema_dist_for_log, iteration)
                 tb_writer.add_scalar('train_loss_patches/normal_loss', ema_normal_for_log, iteration)
+                tb_writer.add_scalar('train_loss_patches/semantic_loss', ema_semantic_for_log, iteration)
 
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
@@ -138,10 +174,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+                semantic_optim.step()
+                semantic_optim.zero_grad(set_to_none=True)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                torch.save(
+                    (gaussians.capture(), semantic_head.state_dict(), semantic_optim.state_dict(), iteration),
+                    scene.model_path + "/chkpnt" + str(iteration) + ".pth",
+                )
 
         with torch.no_grad():        
             if network_gui.conn == None:

@@ -34,6 +34,10 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    # Optional semantic preprocessing artifacts. Both None when no SAM3
+    # preprocessing has been run for this scene.
+    regions_path: str = None    # path to <stem>_regions.png  (uint16 region IDs)
+    embeds_path: str = None     # path to <stem>_embeds.npy   (R+1, K_target) float16
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -65,7 +69,23 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def _semantic_paths(images_folder, image_stem, sam_dir):
+    """Resolve sibling paths for SAM3 region map + SigLIP2 embeds, if present.
+
+    Looks in <parent of images_folder>/<sam_dir>/. Returns (regions_path,
+    embeds_path) or (None, None) if either file is missing.
+    """
+    if not sam_dir:
+        return None, None
+    base = os.path.join(os.path.dirname(images_folder.rstrip(os.sep)), sam_dir)
+    regions = os.path.join(base, f"{image_stem}_regions.png")
+    embeds = os.path.join(base, f"{image_stem}_embeds.npy")
+    if os.path.exists(regions) and os.path.exists(embeds):
+        return regions, embeds
+    return None, None
+
+
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, sam_dir=None):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -98,8 +118,11 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
 
+        regions_path, embeds_path = _semantic_paths(images_folder, image_name, sam_dir)
+
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=image_path, image_name=image_name, width=width, height=height,
+                              regions_path=regions_path, embeds_path=embeds_path)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -129,7 +152,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, llffhold=8):
+def readColmapSceneInfo(path, images, eval, llffhold=8, sam_dir=None):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -142,7 +165,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir), sam_dir=sam_dir)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
