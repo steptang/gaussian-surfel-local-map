@@ -79,8 +79,15 @@ def build_sam3():
 
 
 def _to_bool_mask(mask, H, W):
-    """Coerce SAM3's per-instance mask to a (H, W) bool ndarray."""
+    """Coerce SAM3's per-instance mask to a (H, W) bool ndarray.
+
+    Under torch.autocast bf16, SAM3 may return mask probabilities as a
+    bfloat16 tensor; numpy doesn't natively support bf16 so we cast to
+    float32 first.
+    """
     if isinstance(mask, torch.Tensor):
+        if mask.dtype in (torch.bfloat16, torch.float16):
+            mask = mask.float()
         mask = mask.detach().cpu().numpy()
     mask = np.asarray(mask)
     # SAM3 may return float probabilities; threshold at 0.5
@@ -179,6 +186,15 @@ def main():
 
     concepts = load_concepts(args)
     print(f"using {len(concepts)} concepts (first 5: {concepts[:5]}{'...' if len(concepts)>5 else ''})")
+
+    # SAM3's ViT runs in bf16 -- some internal paths (flash-attn-3 in
+    # particular) emit bf16 activations while Linear weights stay fp32,
+    # which mismatches without autocast. The example notebooks enter the
+    # autocast permanently; we do the same here so every model call inside
+    # the per-image loop is covered.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
 
     print("loading SAM3...")
     model, ProcessorCls = build_sam3()
