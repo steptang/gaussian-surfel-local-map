@@ -37,6 +37,29 @@ from scene.gaussian_model import SEMANTIC_DIM
 from utils.semantic_loss import SemanticHead
 
 
+def _unwrap_pooled(out):
+    """Coerce a SigLIP2 (image|text)-features call result to a (B, K_target) tensor.
+
+    Matches the helper in preprocess/siglip2_embeddings.py. Different
+    transformers releases have shipped Siglip2Model.get_*_features
+    returning either a torch.Tensor or a BaseModelOutputWithPooling; we
+    accept both. The same unwrap order works for image and text since
+    BaseModelOutputWithPooling exposes the same attribute names on either
+    tower.
+    """
+    if isinstance(out, torch.Tensor):
+        return out
+    if hasattr(out, "pooler_output") and out.pooler_output is not None:
+        return out.pooler_output
+    if hasattr(out, "text_embeds") and out.text_embeds is not None:
+        return out.text_embeds
+    if hasattr(out, "image_embeds") and out.image_embeds is not None:
+        return out.image_embeds
+    if hasattr(out, "last_hidden_state"):
+        return out.last_hidden_state.mean(dim=1)
+    raise RuntimeError(f"unexpected SigLIP2 output type: {type(out).__name__}")
+
+
 def encode_text_query(query: str, variant: str):
     """Returns (1, K_target) text embedding from SigLIP2's text encoder."""
     from transformers import AutoModel, AutoProcessor
@@ -44,7 +67,7 @@ def encode_text_query(query: str, variant: str):
     processor = AutoProcessor.from_pretrained(variant)
     inputs = processor(text=[query], padding="max_length", return_tensors="pt").to("cuda")
     with torch.no_grad():
-        text_emb = model.get_text_features(**inputs)        # (1, K_target)
+        text_emb = _unwrap_pooled(model.get_text_features(**inputs))   # (1, K_target)
     return text_emb
 
 
