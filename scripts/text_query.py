@@ -90,7 +90,11 @@ def main():
     # no sense (rendered features live in arbitrary surfel-space).
     semantic_head = SemanticHead(SEMANTIC_DIM, dataset.K_target).cuda().eval()
     if args.checkpoint is not None:
-        ckpt = torch.load(args.checkpoint)
+        # weights_only=False: the chkpnt*.pth tuple contains the gaussians
+        # capture (with optimizer state -> numpy scalars) plus the
+        # SemanticHead state. PyTorch 2.6+ rejects numpy types under the
+        # safe-load default; we trust our own checkpoint files.
+        ckpt = torch.load(args.checkpoint, weights_only=False)
         head_state = ckpt[1]
         if head_state is None:
             raise SystemExit("checkpoint has no semantic head; was lambda_semantic > 0 during training?")

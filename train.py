@@ -45,7 +45,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     semantic_optim = torch.optim.Adam(semantic_head.parameters(), lr=opt.semantic_lr)
 
     if checkpoint:
-        (model_params, head_state, head_optim_state, first_iter) = torch.load(checkpoint)
+        # weights_only=False is required on PyTorch 2.6+: training checkpoints
+        # carry optimizer state (numpy scalars for Adam step counters, etc.)
+        # which the new safe-load default rejects.
+        (model_params, head_state, head_optim_state, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
         if head_state is not None:
             semantic_head.load_state_dict(head_state)
