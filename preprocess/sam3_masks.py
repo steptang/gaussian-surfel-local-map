@@ -81,22 +81,34 @@ def build_sam3():
 def _to_bool_mask(mask, H, W):
     """Coerce SAM3's per-instance mask to a (H, W) bool ndarray.
 
-    Under torch.autocast bf16, SAM3 may return mask probabilities as a
-    bfloat16 tensor; numpy doesn't natively support bf16 so we cast to
-    float32 first.
+    SAM3 returns masks of shape (1, H, W) -- there's a leading channel dim
+    from the `interpolate(out_masks.unsqueeze(1), (img_h, img_w))` inside
+    Sam3Processor._forward_grounding. PIL.Image.fromarray treats anything
+    with shape[0] != H_image as a multi-channel image, so we have to
+    squeeze the leading singleton(s) before any 2D processing.
+
+    Under torch.autocast bf16, mask logits may also come through as a
+    bfloat16 tensor; numpy doesn't natively support bf16 so we cast first.
     """
     if isinstance(mask, torch.Tensor):
         if mask.dtype in (torch.bfloat16, torch.float16):
             mask = mask.float()
         mask = mask.detach().cpu().numpy()
     mask = np.asarray(mask)
-    # SAM3 may return float probabilities; threshold at 0.5
+    # Strip leading singleton dims: (1, H, W) or (1, 1, H, W) -> (H, W).
+    while mask.ndim > 2 and mask.shape[0] == 1:
+        mask = mask[0]
+    # SAM3 typically returns bool already (state["masks"] = out_masks > 0.5);
+    # threshold defensively in case logits leak through.
     if mask.dtype != bool:
         mask = mask > 0.5
+    if mask.ndim != 2:
+        # Genuinely degenerate -- caller should drop this prediction.
+        return None
     if mask.shape != (H, W):
-        # Some pipelines pad to model resolution; resize via PIL nearest
+        # Resize at full uint8 range so PIL picks 'L' mode unambiguously.
         mask = np.array(
-            Image.fromarray(mask.astype(np.uint8)).resize((W, H), Image.NEAREST)
+            Image.fromarray((mask.astype(np.uint8) * 255), mode='L').resize((W, H), Image.NEAREST)
         ).astype(bool)
     return mask
 
@@ -122,7 +134,7 @@ def collect_concept_masks(processor, inference_state, concepts, image_size, conf
             if score < confidence:
                 continue
             bool_mask = _to_bool_mask(m, H, W)
-            if bool_mask.sum() < 64:
+            if bool_mask is None or bool_mask.sum() < 64:
                 continue
             out.append((bool_mask, score, c))
     return out
