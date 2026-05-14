@@ -96,7 +96,7 @@ def test_forward_features_zero_when_disabled():
     rasterizer = GaussianRasterizer(settings)
     means3D, means2D, colors, opacity, scales, rotations = _toy_gaussians()
 
-    rgb_a, _, _, feat_a = rasterizer(
+    rgb_a, _, _, feat_a, _, _ = rasterizer(
         means3D=means3D, means2D=means2D, opacities=opacity,
         colors_precomp=colors, scales=scales, rotations=rotations,
     )
@@ -122,7 +122,7 @@ def test_forward_features_match_rgb_path():
     feat = torch.zeros(colors.shape[0], SEMANTIC_DIM, device="cuda")
     feat[:, :3] = colors
 
-    rgb, _, _, sem = rasterizer(
+    rgb, _, _, sem, _, _ = rasterizer(
         means3D=means3D, means2D=means2D, opacities=opacity,
         colors_precomp=colors, scales=scales, rotations=rotations,
         extra_features=feat,
@@ -146,7 +146,7 @@ def test_backward_features_grad_flows():
     means3D, means2D, colors, opacity, scales, rotations = _toy_gaussians()
     feat = torch.randn(colors.shape[0], SEMANTIC_DIM, device="cuda", requires_grad=True)
 
-    _, _, _, sem = rasterizer(
+    _, _, _, sem, _, _ = rasterizer(
         means3D=means3D, means2D=means2D, opacities=opacity,
         colors_precomp=colors, scales=scales, rotations=rotations,
         extra_features=feat,
@@ -167,11 +167,11 @@ def test_baseline_regression_no_features():
     rasterizer = GaussianRasterizer(settings)
     means3D, means2D, colors, opacity, scales, rotations = _toy_gaussians()
 
-    rgb_a, _, _, _ = rasterizer(
+    rgb_a, _, _, _, _, _ = rasterizer(
         means3D=means3D, means2D=means2D, opacities=opacity,
         colors_precomp=colors, scales=scales, rotations=rotations,
     )
-    rgb_b, _, _, _ = rasterizer(
+    rgb_b, _, _, _, _, _ = rasterizer(
         means3D=means3D, means2D=means2D, opacities=opacity,
         colors_precomp=colors, scales=scales, rotations=rotations,
     )

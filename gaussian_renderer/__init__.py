@@ -16,7 +16,7 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, render_semantic: bool = True):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, render_semantic: bool = True, record_contrib: bool = False):
     """
     Render the scene.
 
@@ -27,6 +27,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     (FEATURE_DIM, H, W) feature map which is returned in the result dict
     under "rendered_semantic". Set render_semantic=False to skip the feature
     accumulator entirely (e.g., during pure novel-view synthesis at deploy).
+
+    When record_contrib is True the rasterizer additionally returns top-K
+    alpha-composite contributor IDs and weights per pixel as
+    "rendered_contrib_ids" (int32, (K, H, W)) and "rendered_contrib_weights"
+    (float32, (K, H, W)). Used post-hoc by fusion/fuse_surfels.py to map
+    SAM3 regions back to the contributing surfels. Default False; the
+    training loop does not need this.
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -102,7 +109,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
     extra_features = pc.get_semantic if (render_semantic and pc.get_semantic.numel() > 0) else None
 
-    rendered_image, radii, allmap, rendered_semantic = rasterizer(
+    rendered_image, radii, allmap, rendered_semantic, rendered_contrib_ids, rendered_contrib_weights = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -112,6 +119,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         rotations = rotations,
         cov3D_precomp = cov3D_precomp,
         extra_features = extra_features,
+        record_contrib = record_contrib,
     )
     
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
@@ -167,5 +175,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # rendered_semantic is (FEATURE_DIM, H, W) when semantic is enabled,
     # otherwise an empty tensor; downstream loss code handles both cases.
     rets['rendered_semantic'] = rendered_semantic
+    # Contribution buffers are (CONTRIB_TOPK, H, W) int32 / float32 when
+    # record_contrib=True, otherwise empty tensors. Consumers (fusion
+    # pipeline) check numel() before indexing.
+    rets['rendered_contrib_ids'] = rendered_contrib_ids
+    rets['rendered_contrib_weights'] = rendered_contrib_weights
 
     return rets
