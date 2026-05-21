@@ -183,8 +183,12 @@ def main():
     semantic_head.load_state_dict(head_state)
 
     cameras = scene.getTrainCameras()
-    if args.max_views is not None:
-        cameras = cameras[:args.max_views]
+    # get_combined_args drops cmdline args whose value is None when merging
+    # with cfg_args, so attributes that default to None never reach the
+    # final Namespace. getattr keeps this script robust to that quirk.
+    max_views = getattr(args, "max_views", None)
+    if max_views is not None:
+        cameras = cameras[:max_views]
     if not cameras:
         raise SystemExit("no train cameras loaded")
 
