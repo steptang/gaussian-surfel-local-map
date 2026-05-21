@@ -100,6 +100,42 @@ def _parse_region_record(record: dict) -> tuple[int, str, str, float]:
     return rid, material, level, conf
 
 
+def compute_region_contributions(
+    region_id: int,
+    region_map: np.ndarray,        # (H, W) int
+    contrib_ids: np.ndarray,       # (K, H, W) int
+    contrib_weights: np.ndarray,   # (K, H, W) float
+    vlm_confidence: float,
+    n_surfels: int,
+    min_weight: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pure: map (region pixels, contrib buffers, vlm_confidence) -> per-surfel omega.
+
+    Returns (active_surfel_ids, omega_per_surfel). Shared by the in-place
+    fusion driver (apply_region_update) and the training-pair generator
+    (generate_training_data.generate_scene_pairs).
+    """
+    mask = (region_map == region_id)
+    num_px = int(mask.sum())
+    if num_px == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
+
+    ids = contrib_ids[:, mask].ravel()
+    wts = contrib_weights[:, mask].ravel()
+    valid = ids >= 0
+    if not valid.any():
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
+    ids = ids[valid].astype(np.int64)
+    wts = wts[valid].astype(np.float64)
+
+    per_surfel_w = np.bincount(ids, weights=wts, minlength=n_surfels)
+    active = np.flatnonzero(per_surfel_w > min_weight)
+    if active.size == 0:
+        return active, np.zeros(0, dtype=np.float64)
+    omega = vlm_confidence * per_surfel_w[active] / float(num_px)
+    return active, omega
+
+
 def apply_region_update(
     state: SurfelPhysicalState,
     region_id: int,
@@ -118,25 +154,17 @@ def apply_region_update(
     update strength is invariant to region pixel count. Returns the number
     of surfels touched by this call.
     """
-    mask = (region_map == region_id)
-    num_px = int(mask.sum())
-    if num_px == 0:
-        return 0
-
-    ids = contrib_ids[:, mask].ravel()
-    wts = contrib_weights[:, mask].ravel()
-    valid = ids >= 0
-    if not valid.any():
-        return 0
-    ids = ids[valid].astype(np.int64)
-    wts = wts[valid].astype(np.float64)
-
-    per_surfel_w = np.bincount(ids, weights=wts, minlength=state.tau.size)
-    active = np.flatnonzero(per_surfel_w > min_weight)
+    active, omega = compute_region_contributions(
+        region_id=region_id,
+        region_map=region_map,
+        contrib_ids=contrib_ids,
+        contrib_weights=contrib_weights,
+        vlm_confidence=vlm_confidence,
+        n_surfels=state.tau.size,
+        min_weight=min_weight,
+    )
     if active.size == 0:
         return 0
-
-    omega = vlm_confidence * per_surfel_w[active] / float(num_px)
     new_tau, new_kappa, new_alpha, new_beta = update_fn(
         state.tau[active], state.kappa[active], state.alpha[active], state.beta[active],
         obs_value, omega,
