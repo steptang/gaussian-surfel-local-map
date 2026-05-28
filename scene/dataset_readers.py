@@ -199,7 +199,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, sam_dir=None):
                            ply_path=ply_path)
     return scene_info
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", sam_dir=None):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -233,19 +233,35 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
 
             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            FovY = fovy 
+            FovY = fovy
             FovX = fovx
 
+            # Optional SAM3 + SigLIP2 artifacts. Look up the per-image
+            # sibling files in <path>/<sam_dir>/<stem>_regions.png and
+            # <path>/<sam_dir>/<stem>_embeds.npy, mirroring the COLMAP
+            # reader's _semantic_paths convention but rooted at the
+            # scene dir (Blender layouts don't have a separate
+            # images_folder).
+            regions_path = None
+            embeds_path = None
+            if sam_dir:
+                base = os.path.join(path, sam_dir)
+                rp = os.path.join(base, f"{image_name}_regions.png")
+                ep = os.path.join(base, f"{image_name}_embeds.npy")
+                if os.path.exists(rp) and os.path.exists(ep):
+                    regions_path, embeds_path = rp, ep
+
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
-            
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
+                            regions_path=regions_path, embeds_path=embeds_path))
+
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
+def readNerfSyntheticInfo(path, white_background, eval, extension=".png", sam_dir=None):
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, sam_dir=sam_dir)
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension, sam_dir=sam_dir)
     
     if not eval:
         train_cam_infos.extend(test_cam_infos)

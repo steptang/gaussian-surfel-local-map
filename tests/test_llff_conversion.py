@@ -1,0 +1,139 @@
+"""Sanity checks on the LLFF -> OpenCV/COLMAP pose conversion.
+
+These tests can't verify the *absolute* axis-flip direction (that
+requires running a reconstruction and inspecting a render -- exactly
+the verification step Stephanie planned for the single-timestep
+driver run). They DO verify properties that any correct conversion
+must satisfy, which catches regressions if the canonical formula is
+ever edited incorrectly:
+
+1. orthogonal: converted R is orthogonal (R @ R.T == I).
+2. proper_rotation: det(R) == +1 (NOT -1, which would mean we
+   introduced a mirror via the wrong sign on an axis).
+3. translation_preserved: T column is byte-for-byte unchanged.
+4. shape_invariants: (3, 5) per-camera in, (4, 4) c2w out.
+
+Run from repo root with: pytest tests/test_llff_conversion.py -v
+"""
+
+import math
+import os
+import sys
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from tracking.data.llff_conversion import (
+    hwf_to_fov,
+    llff_to_2dgs,
+    llff_to_opencv_c2w,
+    opencv_c2w_to_2dgs_RT,
+    parse_poses_bounds,
+)
+
+
+def _make_random_llff_poses(n: int, seed: int = 0) -> np.ndarray:
+    """N random valid LLFF 3x5 poses (rotation columns are orthonormal)."""
+    rng = np.random.default_rng(seed)
+    poses = np.zeros((n, 3, 5), dtype=np.float64)
+    for i in range(n):
+        # Random rotation via QR of a Gaussian matrix.
+        A = rng.normal(size=(3, 3))
+        Q, _ = np.linalg.qr(A)
+        if np.linalg.det(Q) < 0:
+            Q[:, 0] *= -1   # ensure proper rotation
+        poses[i, :, :3] = Q
+        poses[i, :, 3] = rng.normal(size=3) * 2.0   # translation
+        poses[i, :, 4] = [480.0, 640.0, 500.0]       # h, w, f
+    return poses
+
+
+def test_shape_invariants():
+    poses = _make_random_llff_poses(3)
+    c2w = llff_to_opencv_c2w(poses)
+    assert c2w.shape == (3, 4, 4)
+    # Bottom row is exactly [0, 0, 0, 1].
+    np.testing.assert_array_equal(c2w[:, 3, :3], 0)
+    np.testing.assert_array_equal(c2w[:, 3, 3], 1)
+
+
+def test_converted_R_is_orthogonal():
+    # If the conversion ever broke (e.g., we forgot to negate a column
+    # or swapped two columns inconsistently), R would no longer satisfy
+    # R @ R.T == I.
+    poses = _make_random_llff_poses(5)
+    c2w = llff_to_opencv_c2w(poses)
+    R = c2w[:, :3, :3]
+    eye = np.broadcast_to(np.eye(3), (5, 3, 3))
+    np.testing.assert_allclose(R @ R.transpose(0, 2, 1), eye, atol=1e-12)
+
+
+def test_converted_R_is_proper_rotation_not_mirror():
+    # det(R) should be exactly +1. A wrong axis-flip (e.g., -col0
+    # instead of +col0 when going from LLFF "down" to COLMAP "down")
+    # would produce det = -1 silently and the rendered geometry would
+    # be mirrored.
+    poses = _make_random_llff_poses(8)
+    c2w = llff_to_opencv_c2w(poses)
+    dets = np.linalg.det(c2w[:, :3, :3])
+    np.testing.assert_allclose(dets, 1.0, atol=1e-12,
+                                err_msg="converted rotation matrices are not proper rotations -- LLFF axis flip is wrong")
+
+
+def test_translation_column_preserved():
+    poses = _make_random_llff_poses(4, seed=42)
+    c2w = llff_to_opencv_c2w(poses)
+    # T (camera position in world) is the fourth column of the input
+    # and the [:3, 3] of the output. The conversion must not touch it.
+    np.testing.assert_array_equal(c2w[:, :3, 3], poses[:, :, 3])
+
+
+def test_opencv_c2w_to_2dgs_RT_inverts_round_trip():
+    # opencv_c2w_to_2dgs_RT returns R, T such that:
+    #   inv_c2w = R.T (un-transposed) on top of T.
+    # Verify we can reconstruct c2w from (R, T).
+    poses = _make_random_llff_poses(3)
+    c2w = llff_to_opencv_c2w(poses)
+    R_2dgs, T_2dgs = opencv_c2w_to_2dgs_RT(c2w)
+    # R_2dgs is w2c[:3, :3].T -> w2c rotation is R_2dgs.T.
+    w2c = np.zeros_like(c2w)
+    w2c[:, :3, :3] = R_2dgs.transpose(0, 2, 1)
+    w2c[:, :3, 3] = T_2dgs
+    w2c[:, 3, 3] = 1.0
+    np.testing.assert_allclose(np.linalg.inv(w2c), c2w, atol=1e-10)
+
+
+def test_hwf_to_fov_matches_pinhole_definition():
+    # f = h / (2 * tan(FoVY/2))  =>  FoVY = 2 * arctan(h / (2f))
+    hwf = np.array([[480, 640, 500.0]], dtype=np.float64)
+    fx, fy = hwf_to_fov(hwf)
+    assert math.isclose(float(fy), 2.0 * math.atan(240.0 / 500.0), abs_tol=1e-12)
+    assert math.isclose(float(fx), 2.0 * math.atan(320.0 / 500.0), abs_tol=1e-12)
+
+
+def test_llff_to_2dgs_keys_and_shapes():
+    poses = _make_random_llff_poses(3)
+    bounds = np.array([[0.5, 50.0], [0.4, 40.0], [0.6, 60.0]])
+    raw = np.concatenate([poses.reshape(3, 15), bounds], axis=1)
+    out = llff_to_2dgs(raw)
+    assert set(out.keys()) == {"R", "T", "FovX", "FovY", "height", "width", "bounds", "c2w"}
+    assert out["R"].shape == (3, 3, 3)
+    assert out["T"].shape == (3, 3)
+    assert out["FovX"].shape == (3,)
+    assert out["FovY"].shape == (3,)
+    assert out["height"].tolist() == [480, 480, 480]
+    assert out["width"].tolist() == [640, 640, 640]
+    np.testing.assert_array_equal(out["bounds"], bounds)
+    # Same orthogonality + det invariants on the c2w side.
+    R = out["c2w"][:, :3, :3]
+    np.testing.assert_allclose(R @ R.transpose(0, 2, 1), np.broadcast_to(np.eye(3), (3, 3, 3)), atol=1e-12)
+    np.testing.assert_allclose(np.linalg.det(R), 1.0, atol=1e-12)
+
+
+def test_parse_poses_bounds_rejects_bad_shape():
+    with pytest.raises(ValueError):
+        parse_poses_bounds(np.zeros((3, 16)))   # missing bounds column
+    with pytest.raises(ValueError):
+        parse_poses_bounds(np.zeros((3,)))       # not 2D
