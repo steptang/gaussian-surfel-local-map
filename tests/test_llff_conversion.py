@@ -137,3 +137,47 @@ def test_parse_poses_bounds_rejects_bad_shape():
         parse_poses_bounds(np.zeros((3, 16)))   # missing bounds column
     with pytest.raises(ValueError):
         parse_poses_bounds(np.zeros((3,)))       # not 2D
+
+
+def test_fov_is_resolution_invariant():
+    """Pin the silent-failure guarantee for the DMV resize case.
+
+    The h5 frames are downsized (e.g., 1080x1920 -> 360x640, 1/3 scale)
+    while poses_bounds.npy carries the LLFF native focal at the
+    pre-resize resolution. Because the loader stores *FoV* (not focal)
+    and the Blender reader re-derives focal at the actual image size,
+    the rescale is implicit and correct -- but only if FoV stays
+    resolution-invariant. This test pins that:
+
+        FoVX(1920, 984) == FoVX(640, 328)
+        FoVY(1080, 984) == FoVY(360, 328)
+
+    If anyone refactors llff_conversion to pass focal-in-pixels through
+    directly, this test will fail and surface the silent-failure mode
+    Stephanie called out (correct orientation, wrong projection scale).
+    """
+    # Native LLFF intrinsics.
+    full_hwf = np.array([[1080.0, 1920.0, 984.0]])
+    # H5-resized intrinsics with f scaled by the same 1/3 factor.
+    h5_hwf = np.array([[360.0, 640.0, 984.0 / 3.0]])
+
+    fovx_full, fovy_full = hwf_to_fov(full_hwf)
+    fovx_h5, fovy_h5 = hwf_to_fov(h5_hwf)
+
+    np.testing.assert_allclose(fovx_full, fovx_h5, atol=1e-12,
+                                err_msg="FoVX changed across the 1/3 resize -- focal isn't being rescaled correctly")
+    np.testing.assert_allclose(fovy_full, fovy_h5, atol=1e-12,
+                                err_msg="FoVY changed across the 1/3 resize")
+
+    # And the inverse-direction check: feeding FoVX through the Blender
+    # reader's focal2fov(fov2focal(...)) chain at the h5 resolution must
+    # return a focal of exactly 984/3 = 328 (the correctly-rescaled focal).
+    # Inlined to avoid a torch dep just for the formula:
+    #   fov2focal(fov, pixels) = pixels / (2 * tan(fov / 2))
+    #   focal2fov(f,   pixels) = 2 * arctan(pixels / (2 * f))
+    f_implied_at_640 = 640.0 / (2.0 * math.tan(float(fovx_full[0]) / 2.0))
+    np.testing.assert_allclose(f_implied_at_640, 984.0 / 3.0, atol=1e-9,
+                                err_msg="reader-side focal at h5 resolution doesn't match the LLFF focal / 3")
+    # The FoVY the reader derives from (FovX, h5 H, h5 W) must match too.
+    fovy_implied = 2.0 * math.atan(360.0 / (2.0 * f_implied_at_640))
+    np.testing.assert_allclose(fovy_implied, float(fovy_h5[0]), atol=1e-9)

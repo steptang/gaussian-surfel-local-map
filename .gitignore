@@ -2,7 +2,11 @@
 .vscode
 output
 build
-data
+# Top-level data/ only -- intended for scene inputs (e.g., DTU scans).
+# Without the leading slash this matched 'tracking/data/' as source code
+# was silently dropped from commits. See commit history if you need the
+# back-story.
+/data
 *.ply
 **/PKG-INFO
 # submodules
