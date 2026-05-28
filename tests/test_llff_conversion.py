@@ -132,6 +132,88 @@ def test_llff_to_2dgs_keys_and_shapes():
     np.testing.assert_allclose(np.linalg.det(R), 1.0, atol=1e-12)
 
 
+def _build_synthetic_look_at_poses(n_cameras: int = 8,
+                                    target: np.ndarray = None,
+                                    rig_radius: float = 4.0,
+                                    rig_z: float = 0.0,
+                                    seed: int = 0) -> np.ndarray:
+    """Build a (n, 17) poses_bounds.npy-shaped array where every camera
+    sits on a circle in the xy-plane at z = ``rig_z`` and is oriented to
+    look at ``target``. Stored as **OpenCV c2w** -- the empirically-
+    confirmed convention of the Deep 3D Mask Volume dataset (see
+    ``tracking.data.llff_conversion`` module docstring).
+
+    Returned poses_bounds row layout: 15 floats of 3x5 (in C order)
+    followed by 2 bounds floats.
+    """
+    if target is None:
+        target = np.zeros(3, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    out = np.zeros((n_cameras, 17), dtype=np.float64)
+    for i in range(n_cameras):
+        theta = 2 * math.pi * i / n_cameras
+        eye = np.array([rig_radius * math.cos(theta),
+                        rig_radius * math.sin(theta),
+                        rig_z], dtype=np.float64)
+        # OpenCV look-at: forward = (target - eye)/|.|; world_up = +z
+        # right = forward x world_up; down = forward x right.
+        forward = target - eye
+        forward /= np.linalg.norm(forward)
+        world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        right = np.cross(forward, world_up)
+        right /= max(np.linalg.norm(right), 1e-12)
+        down = np.cross(forward, right)
+        # c2w 3x3: columns are [right, down, forward] for OpenCV.
+        R = np.stack([right, down, forward], axis=1)
+        pose_3x5 = np.zeros((3, 5), dtype=np.float64)
+        pose_3x5[:, :3] = R
+        pose_3x5[:, 3] = eye
+        # hwf -- arbitrary; just needs to be positive so hwf_to_fov is well-defined.
+        pose_3x5[:, 4] = [480.0, 640.0, 500.0]
+        out[i, :15] = pose_3x5.reshape(15)
+        out[i, 15:] = [0.1, 100.0]
+    return out
+
+
+def test_multi_camera_convergence_dot():
+    """Geometric look-at sanity: after llff_to_2dgs, every camera should
+    have ``forward . (target - camera_position) > 0``.
+
+    Catches the silent-failure mode that ``det(R) == +1`` misses: a
+    180-degree rotation about a perpendicular axis is still a proper
+    rotation, but every camera ends up pointing AWAY from the scene
+    rather than toward it.
+
+    This is the regression that the DMV scene-14 debugging surfaced.
+    With the previously-committed ``[col1, col0, -col2]`` permutation
+    every dot was ~ -1; with the corrected identity conversion every
+    dot is ~ +1.
+    """
+    target = np.array([0.5, 0.3, 1.2], dtype=np.float64)
+    arr = _build_synthetic_look_at_poses(n_cameras=8, target=target,
+                                          rig_radius=4.0, rig_z=0.0)
+    out = llff_to_2dgs(arr)
+    R = out["R"]                 # (N, 3, 3) -- w2c rotation transposed for glm
+    T = out["T"]                 # (N, 3)   -- w2c translation
+    N = R.shape[0]
+    # Reconstruct OpenCV c2w: per 2DGS convention, R_stored = c2w_R, T_stored = w2c_t.
+    # Camera position in world = -R_stored @ T_stored.
+    # Forward direction in world = R_stored[:, :, 2] (= c2w[:, :, 2]).
+    cam_pos = -np.einsum("nij,nj->ni", R, T)
+    forward = R[:, :, 2]
+    to_target = target[None, :] - cam_pos
+    to_target /= np.linalg.norm(to_target, axis=1, keepdims=True)
+    dots = (forward * to_target).sum(axis=1)
+    # Every camera must point toward the target. A failure here means
+    # the conversion silently flipped the look-axis on us.
+    assert (dots > 0.99).all(), (
+        f"some cameras don't look at target: dots = {dots} "
+        f"(min={dots.min():.4f}, max={dots.max():.4f}). "
+        "Probable cause: rotation permutation in llff_to_opencv_c2w is wrong "
+        "for this dataset's convention."
+    )
+
+
 def test_parse_poses_bounds_rejects_bad_shape():
     with pytest.raises(ValueError):
         parse_poses_bounds(np.zeros((3, 16)))   # missing bounds column

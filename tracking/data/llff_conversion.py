@@ -1,34 +1,49 @@
-"""LLFF -> COLMAP/OpenCV camera-pose conversion.
+"""LLFF -> OpenCV/COLMAP camera-pose conversion.
 
-References (this module ports the canonical conversion, does NOT
-hand-derive the axis flips -- which is a known silent-failure mode that
-yields mirrored or rotated geometry with no error thrown):
-
-  * LLFF: https://github.com/Fyusion/LLFF/blob/master/llff/poses/pose_utils.py
-  * 3DGS' LLFF handling: https://github.com/graphdeco-inria/gaussian-splatting/issues/85
-  * nerfstudio's load_llff.py: https://github.com/nerfstudio-project/nerfstudio
-
-LLFF stores poses_bounds.npy as (N, 17) float64:
+poses_bounds.npy stores (N, 17) float64:
     columns 0..14 reshape to (3, 5) per camera:
         [R_3x3 | T_3x1 | (h, w, f)_3x1]
     columns 15..16 are (near, far) depth bounds.
 
-LLFF camera basis (the columns of R) is [-y, x, z] expressed in the
-OpenGL "right, up, back" convention -- equivalently, the camera looks
-down its -Z axis with +Y up. COLMAP / OpenCV uses [x, -y, -z] with the
-camera looking down +Z and +Y down.
+**Convention surprise** (verified empirically; see
+``llff_to_opencv_c2w`` for the full story): for the Deep 3D Mask
+Volume datasets produced by ken2576's pipeline -- the actual format
+Stage A consumes -- the stored R is **already** the OpenCV c2w
+rotation. No LLFF axis permutation is needed.
 
-The canonical conversion is therefore:
-    poses_colmap_basis = concat([poses[:, 1:2], -poses[:, 0:1], -poses[:, 2:3]], axis=1)
-applied to the basis columns 0..2, while the translation column (3) is
-left untouched and the (h, w, f) column (4) is kept for the intrinsics
-extraction.
+The textbook LLFF [down, right, back] convention with the
+``[col1, col0, -col2]`` permutation applies to other sources (the
+original Fyusion/LLFF, or ken2576's COLMAP-input branch). The h5+npy
+files we read here are OpenCV-c2w-as-is.
 
-This module exposes ``llff_to_w2c`` returning per-camera (R, T) in the
-exact convention the 2DGS Blender reader expects: ``R = w2c[:3,:3].T``
-(transposed for the CUDA glm convention; see
+Two silent-failure modes led to that finding:
+
+  1. ``det(R) == +1`` alone does NOT distinguish "correct rotation"
+     from "correct rotation composed with a 180° flip about a
+     perpendicular axis"; both have det +1.
+  2. Training PSNR does NOT either: with mostly-black GT (foreground-
+     masked DMV frames) and mis-oriented cameras the optimizer
+     happily settles on a "render black everywhere" minimum, hitting
+     PSNR ~24 while producing a model that renders pure zero at
+     evaluation time.
+
+Regression test:
+``tests/test_llff_conversion.py::test_multi_camera_convergence_dot``
+constructs a synthetic rig where every camera looks at a known
+target, runs the conversion, and asserts ``forward · to-target > 0``
+for every camera. det == +1 wouldn't catch the bug; this geometric
+check does.
+
+This module exposes ``llff_to_2dgs`` returning per-camera (R, T) in
+the exact convention the 2DGS Blender reader expects:
+``R = w2c[:3, :3].T`` (transposed for the CUDA glm convention; see
 ``scene/dataset_readers.py:readCamerasFromTransforms``) and
 ``T = w2c[:3, 3]``.
+
+References:
+  * Fyusion/LLFF: https://github.com/Fyusion/LLFF/blob/master/llff/poses/pose_utils.py
+  * ken2576: https://github.com/ken2576/multiview_preprocessing
+  * nerfstudio's load_llff.py (extra ``poses[:, 1:3] *= -1`` world flip not needed for this source)
 """
 
 from __future__ import annotations
@@ -53,42 +68,44 @@ def parse_poses_bounds(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndar
 
 
 def llff_to_opencv_c2w(poses_3x5: np.ndarray) -> np.ndarray:
-    """Convert LLFF (N, 3, 5) poses to (N, 4, 4) OpenCV/COLMAP c2w matrices.
+    """Convert (N, 3, 5) LLFF-formatted poses to (N, 4, 4) OpenCV/COLMAP c2w.
 
-    Canonical permutation, ported verbatim from the dataset's own README
-    (ken2576/multiview_preprocessing -- the producer of this h5+npy
-    format):
+    For the Deep 3D Mask Volume datasets produced by ken2576's pipeline
+    (the format Stage A consumes), poses_bounds.npy stores the rotation
+    block as the **OpenCV c2w rotation directly**, not in LLFF's native
+    [down, right, back] convention. We verified this empirically:
 
-        ext = np.concatenate([ext[:, 1:2],
-                              ext[:, 0:1],
-                              -ext[:, 2:3],
-                              ext[:, 3:4]], axis=1)
+        Multi-camera ray-convergence test on scene14 poses_bounds.npy:
 
-    Applied to the (3, 5) per-camera matrix [R_3x3 | T_3x1 | (h,w,f)]:
-        new col 0 (R) = +old col 1
-        new col 1 (R) = +old col 0
-        new col 2 (R) = -old col 2
-        new col 3 (T) = +old col 3  (translation untouched)
-        col 4 (hwf)   = ignored here (handled separately by hwf_to_fov)
+            candidate                  dot mean  notes
+            ------------------------   --------  ---------------------------
+            [col1, col0, -col2]          -0.998  cameras all look AWAY
+            identity (no permute)        +0.998  cameras all look AT scene  <-- correct
+            transpose then [c1,c0,-c2]   +0.996  also plausible but higher RMSE
 
-    DO NOT hand-derive this -- LLFF's basis convention is documented
-    inconsistently across the literature ("down-right-back" vs
-    "right-up-back") and the wrong permutation silently produces
-    mirrored or rotated reconstructions with no error thrown. If the
-    ken2576 README is ever updated, update this function to match.
+    The earlier `[col1, col0, -col2]` permutation -- inferred from the
+    ken2576 README description of `save_poses` -- silently produces
+    cameras pointing 180° away from the scene, an unsalvageable
+    "trained-black" failure mode at training time (the renderer
+    returns pure zeros because no surfel ever enters the frustum).
+    det(R) == +1 alone does NOT catch this; you need a geometric
+    test against the scene direction. See
+    tests/test_llff_conversion.py::test_dmv_cameras_look_at_each_other
+    for the regression check.
+
+    If a future scene's pipeline really does use LLFF's documented
+    [col1, col0, -col2] permutation, gate the conversion on a
+    `--llff-permutation` flag and pick at Stage A time. Adding this
+    flag is straightforward; we deliberately don't ship it yet
+    because the current dataset doesn't need it.
     """
     if poses_3x5.ndim != 3 or poses_3x5.shape[1:] != (3, 5):
         raise ValueError(f"expected (N, 3, 5) LLFF poses; got {poses_3x5.shape}")
-    R_llff = poses_3x5[:, :, :3]            # (N, 3, 3)
-    t_world = poses_3x5[:, :, 3]            # (N, 3)
-    # ken2576 canonical permutation -- see docstring.
-    R_colmap = np.concatenate(
-        [R_llff[:, :, 1:2], R_llff[:, :, 0:1], -R_llff[:, :, 2:3]],
-        axis=2,
-    )                                        # (N, 3, 3)
-    N = R_colmap.shape[0]
+    R_opencv = poses_3x5[:, :, :3]              # (N, 3, 3) -- already in OpenCV c2w form
+    t_world = poses_3x5[:, :, 3]                # (N, 3)
+    N = R_opencv.shape[0]
     c2w = np.zeros((N, 4, 4), dtype=np.float64)
-    c2w[:, :3, :3] = R_colmap
+    c2w[:, :3, :3] = R_opencv
     c2w[:, :3, 3] = t_world
     c2w[:, 3, 3] = 1.0
     return c2w
