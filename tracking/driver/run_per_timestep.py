@@ -76,10 +76,18 @@ def _train_one(
     timestep_dir: str,
     out_dir: str,
     iterations: int,
+    checkpoint_iterations: Sequence[int],
     extra_train_args: Sequence[str],
     semantic_args: Sequence[str],
 ) -> None:
-    """Run train.py on one timestep. Raises on non-zero exit."""
+    """Run train.py on one timestep. Raises on non-zero exit.
+
+    checkpoint_iterations is forwarded as the *last* positional
+    arguments of the cmd line. With argparse + ``nargs='+'`` the
+    forwarded values can be swallowed by a preceding flag if anything
+    else after them looks like a non-flag token; placing them last
+    keeps the parser unambiguous.
+    """
     cmd = [
         sys.executable, TRAIN_SCRIPT,
         "-s", timestep_dir,
@@ -87,11 +95,79 @@ def _train_one(
         "--iterations", str(iterations),
     ]
     cmd += list(semantic_args) + list(extra_train_args)
-    # Surface what we're about to run; long-running, useful for resumable logs.
+    # Append checkpoint_iterations *last* so the nargs='+' consumer
+    # doesn't lose the trailing values to a later flag.
+    if checkpoint_iterations:
+        cmd += ["--checkpoint_iterations"] + [str(it) for it in checkpoint_iterations]
     print(f"[run_per_timestep] $ {' '.join(cmd)}", flush=True)
     proc = subprocess.run(cmd, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"train.py failed (exit {proc.returncode}) for {timestep_dir}")
+
+
+def _expected_semantic_artifacts(timestep_dir: str, sam_dir: str) -> list[str]:
+    """Per-camera SAM3 + SigLIP artifacts that train.py's reader looks for.
+
+    For every cam_XX.png under <timestep_dir>/images/ the Blender reader
+    expects matching <timestep_dir>/<sam_dir>/cam_XX_regions.png and
+    cam_XX_embeds.npy. Missing artifacts cause the loss to silently
+    degrade to 0 for that view, producing trained models whose
+    semantic features are random noise -- discoverable only when
+    downstream text query returns garbage. The preflight check below
+    rejects this before any train.py invocation.
+    """
+    images_dir = os.path.join(timestep_dir, "images")
+    sam_full = os.path.join(timestep_dir, sam_dir)
+    expected: list[str] = []
+    if not os.path.isdir(images_dir):
+        return expected
+    for name in sorted(os.listdir(images_dir)):
+        stem, ext = os.path.splitext(name)
+        if ext.lower() not in (".png", ".jpg", ".jpeg"):
+            continue
+        expected.append(os.path.join(sam_full, f"{stem}_regions.png"))
+        expected.append(os.path.join(sam_full, f"{stem}_embeds.npy"))
+    return expected
+
+
+def _preflight_semantic_artifacts(
+    selected_dirs: Sequence[str], sam_dir: str
+) -> None:
+    """Fail fast if any selected timestep is missing its SAM3+SigLIP
+    artifacts. Surfaces a Stage A completeness problem at the start
+    of Stage B rather than after hours of (silently-degraded) training.
+    """
+    summary: list[tuple[str, int, int]] = []   # (timestep_dir, n_missing, n_expected)
+    examples: list[str] = []
+    for d in selected_dirs:
+        expected = _expected_semantic_artifacts(d, sam_dir)
+        if not expected:
+            continue
+        missing = [p for p in expected if not os.path.exists(p)]
+        if missing:
+            summary.append((d, len(missing), len(expected)))
+            # Stash up to 3 example paths per dir, so the user sees the
+            # actual missing filenames not just a count.
+            for p in missing[:3]:
+                examples.append(p)
+    if not summary:
+        return
+    lines = [
+        f"Stage A semantic artifacts missing for {len(summary)} timestep(s); "
+        "did Stage A's SAM3 / SigLIP2 preprocessing complete successfully?",
+    ]
+    for d, nm, ne in summary[:5]:
+        lines.append(f"  {os.path.basename(d)}: {nm}/{ne} per-camera files missing")
+    if len(summary) > 5:
+        lines.append(f"  ... and {len(summary) - 5} more timestep(s)")
+    lines.append("example missing paths:")
+    for p in examples[:6]:
+        lines.append(f"  {p}")
+    lines.append(
+        "to skip semantic supervision intentionally, re-run with --lambda-semantic 0; "
+        "to keep it, fix Stage A and re-run."
+    )
+    raise SystemExit("\n".join(lines))
 
 
 def _render_one(out_dir: str, iteration: int) -> None:
@@ -120,6 +196,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--iterations", type=int, default=30_000,
                    help="full reconstruction iterations per timestep (default 30000; "
                         "use a lower value like 3000 for smoke tests)")
+    p.add_argument("--checkpoint-iterations", nargs="+", type=int, default=None,
+                   help="iterations at which to save chkpnt*.pth (forwarded to train.py "
+                        "as --checkpoint_iterations). Defaults to [--iterations], so the "
+                        "final checkpoint is always saved -- matching the static pipeline's "
+                        "artifact set so text_query.py / cross_view_label_conflict.py / etc. "
+                        "work without dynamics-specific patches.")
 
     # Semantic-loss knobs (must mirror values used by Stage A's SAM3/SigLIP run).
     p.add_argument("--lambda-semantic", type=float, default=0.5,
@@ -128,6 +210,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="SigLIP2 embedding dim; must match Stage A's --variant choice")
     p.add_argument("--sam-dir", default="sam3",
                    help="subdir under each timestep_*/ where SAM3 outputs live")
+    p.add_argument("--skip-preflight", action="store_true",
+                   help="skip the SAM3 + SigLIP2 artifact preflight check (default: check, "
+                        "fail fast if Stage A is incomplete). Use only if you know what you're doing.")
 
     # Verification helper.
     p.add_argument("--render", action="store_true",
@@ -135,7 +220,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # Pass-through for any extra train.py args.
     p.add_argument("--train-arg", action="append", default=[],
-                   help="extra argument forwarded to train.py (repeatable)")
+                   help="extra argument forwarded to train.py (repeatable). For multi-value "
+                        "flags like --checkpoint_iterations, prefer the dedicated driver flag "
+                        "to avoid argparse quoting bugs.")
     return p
 
 
@@ -149,9 +236,28 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"no timestep_* dirs under {args.work_root}; run Stage A first")
     selected = _filter_timesteps(all_dirs, args.timesteps)
     indices = _parse_timestep_indices(selected)
+
+    # Resolve checkpoint_iterations. Default to [--iterations] so Stage B's
+    # output directory contains the same artifacts as the static pipeline
+    # (point_cloud + cfg_args + chkpnt*.pth). text_query.py and similar
+    # downstream tools depend on chkpnt*.pth; failing to produce it by
+    # default has bitten this pipeline before.
+    if args.checkpoint_iterations is None:
+        checkpoint_iterations = [args.iterations]
+    else:
+        checkpoint_iterations = list(args.checkpoint_iterations)
+
     print(f"[run_per_timestep] reconstructing {len(selected)} timesteps: "
           f"{indices[:8]}{'...' if len(indices) > 8 else ''}")
     print(f"[run_per_timestep] iterations per timestep: {args.iterations}")
+    print(f"[run_per_timestep] checkpoint_iterations: {checkpoint_iterations}")
+
+    # Preflight: catch missing SAM3/SigLIP2 artifacts before any train.py
+    # invocation. With semantic loss enabled but no artifacts on disk, the
+    # loss silently degrades to 0 and the trained model carries random
+    # semantic features -- a failure only discoverable downstream.
+    if args.lambda_semantic > 0 and not args.skip_preflight:
+        _preflight_semantic_artifacts(selected, args.sam_dir)
 
     semantic_args: list[str] = []
     if args.lambda_semantic > 0:
@@ -170,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
             timestep_dir=src,
             out_dir=out_dir,
             iterations=args.iterations,
+            checkpoint_iterations=checkpoint_iterations,
             extra_train_args=args.train_arg,
             semantic_args=semantic_args,
         )

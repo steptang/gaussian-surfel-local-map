@@ -25,9 +25,11 @@ what the training code expects.
 
 from __future__ import annotations
 
+import collections
 import os
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -35,6 +37,12 @@ from typing import Iterable
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SAM3_SCRIPT = os.path.join(REPO_ROOT, "preprocess", "sam3_masks.py")
 SIGLIP_SCRIPT = os.path.join(REPO_ROOT, "preprocess", "siglip2_embeddings.py")
+
+# How many lines of the failing subprocess' stderr to include in the
+# raised RuntimeError. Caps message length while making the actual
+# error (e.g., a missing-file traceback) immediately visible without
+# scrolling through hundreds of lines of progress output.
+_STDERR_TAIL_LINES = 30
 
 
 @dataclass(frozen=True)
@@ -57,13 +65,51 @@ def _check_scripts_exist():
 
 
 def _run(cmd: list[str], description: str) -> None:
-    """Spawn cmd; surface non-zero exit codes with the captured stderr tail."""
+    """Spawn cmd; stream stderr to the parent's stderr in real time AND
+    keep a tail buffer so the actual failure mode is in the error
+    message.
+
+    Previously this used subprocess.run() without capture, which
+    streamed errors fine but produced a RuntimeError that said only
+    "exit 1; cmd: ..." -- the real cause (e.g.,
+    ``FileNotFoundError: .../bpe_simple_vocab_16e6.txt.gz``) was
+    visible only if you scrolled all the way up through the SAM3
+    progress output. With many timesteps that scrollback is huge and
+    the error gets buried.
+
+    Now we use a Popen + thread pair so:
+      1. stderr lines stream to the parent's stderr immediately (no
+         loss of real-time feedback during long preprocessing runs).
+      2. The last ``_STDERR_TAIL_LINES`` lines are captured into a
+         bounded deque and appended to the RuntimeError on non-zero
+         exit, so the failure cause is visible without scrolling.
+    """
     print(f"[preprocess_semantic] {description}: {' '.join(cmd)}", flush=True)
-    proc = subprocess.run(cmd, check=False)
+    tail: collections.deque[str] = collections.deque(maxlen=_STDERR_TAIL_LINES)
+
+    proc = subprocess.Popen(
+        cmd, stderr=subprocess.PIPE, stdout=None, bufsize=1,
+        text=True, encoding="utf-8", errors="replace",
+    )
+
+    def _pump_stderr() -> None:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+            tail.append(line.rstrip("\n"))
+
+    t = threading.Thread(target=_pump_stderr, daemon=True)
+    t.start()
+    proc.wait()
+    t.join()
+
     if proc.returncode != 0:
+        tail_str = "\n".join(tail) if tail else "(no stderr captured)"
         raise RuntimeError(
-            f"{description} failed (exit {proc.returncode}); "
-            f"cmd: {' '.join(cmd)}"
+            f"{description} failed (exit {proc.returncode}).\n"
+            f"cmd: {' '.join(cmd)}\n"
+            f"--- last {len(tail)} line(s) of stderr ---\n{tail_str}"
         )
 
 
