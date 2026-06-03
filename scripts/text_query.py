@@ -111,13 +111,19 @@ def main():
     # Restore the SemanticHead from checkpoint. The PLY by itself doesn't
     # store it because it isn't per-surfel. Without the head, queries make
     # no sense (rendered features live in arbitrary surfel-space).
+    # NB: read via getattr because get_combined_args drops cmdline keys
+    # whose value is None (arguments/__init__.py:134-136), and the saved
+    # cfg_args from training doesn't carry --checkpoint either; without
+    # the guard, args.checkpoint raises AttributeError when the flag is
+    # omitted instead of falling through to the untrained-head warning.
     semantic_head = SemanticHead(SEMANTIC_DIM, dataset.K_target).cuda().eval()
-    if args.checkpoint is not None:
+    ckpt_path = getattr(args, "checkpoint", None)
+    if ckpt_path is not None:
         # weights_only=False: the chkpnt*.pth tuple contains the gaussians
         # capture (with optimizer state -> numpy scalars) plus the
         # SemanticHead state. PyTorch 2.6+ rejects numpy types under the
         # safe-load default; we trust our own checkpoint files.
-        ckpt = torch.load(args.checkpoint, weights_only=False)
+        ckpt = torch.load(ckpt_path, weights_only=False)
         head_state = ckpt[1]
         if head_state is None:
             raise SystemExit("checkpoint has no semantic head; was lambda_semantic > 0 during training?")
