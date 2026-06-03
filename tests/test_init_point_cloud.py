@@ -26,7 +26,9 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tracking.data.init_point_cloud import (
+    camera_baseline,
     compute_camera_convergence,
+    derive_baseline_bounds,
     init_point_cloud_in_frustums,
     write_points3d_ply,
 )
@@ -104,6 +106,71 @@ def test_convergence_with_parallel_cameras_has_large_rmse():
 def test_convergence_rejects_bad_shape():
     with pytest.raises(ValueError):
         compute_camera_convergence(np.zeros((3, 3)))
+
+
+# ---------- camera_baseline / derive_baseline_bounds ----------
+
+def test_camera_baseline_recovers_max_pairwise_distance():
+    """Baseline = max pairwise distance between camera centres.
+    For a ring of cameras at radius R, this is the diameter 2R."""
+    c2ws = _ring_of_cameras(np.zeros(3), n=8, radius=3.5)
+    bl = camera_baseline(c2ws)
+    assert abs(bl - 7.0) < 1e-9
+
+
+def test_camera_baseline_handles_asymmetric_rig():
+    """Manually construct three cameras with a known max-pair distance."""
+    eyes = [np.array([0.0, 0.0, 0.0]),
+            np.array([1.0, 0.0, 0.0]),
+            np.array([0.0, 4.0, 0.0])]
+    target = np.array([0.0, 0.0, 5.0])
+    c2ws = np.stack([_camera_looking_at(e, target) for e in eyes], axis=0)
+    bl = camera_baseline(c2ws)
+    # Max pair is (0,0,0) <-> (0,4,0) -> sqrt(1+16) ~= 4.123 actually,
+    # but (1,0,0) <-> (0,4,0) = sqrt(1+16) ~= 4.123 too; check explicitly.
+    expected = math.sqrt(1 + 16)
+    assert abs(bl - expected) < 1e-9
+
+
+def test_camera_baseline_rejects_bad_shape():
+    with pytest.raises(ValueError):
+        camera_baseline(np.zeros((3, 3)))
+
+
+def test_derive_baseline_bounds_returns_uniform_per_camera():
+    """All N rows must equal [near_floor, far_factor * baseline].
+    Use n=8 (even) so the diameter is exactly 2*radius -- odd-count
+    rings have a non-trivial max-pair geometry."""
+    c2ws = _ring_of_cameras(np.zeros(3), n=8, radius=3.0)  # baseline = 6
+    bounds = derive_baseline_bounds(c2ws, near_floor=0.02, far_factor=2.0)
+    assert bounds.shape == (8, 2)
+    expected = np.array([0.02, 12.0])
+    for row in bounds:
+        np.testing.assert_allclose(row, expected, atol=1e-9)
+
+
+def test_derive_baseline_bounds_rejects_co_located_cameras():
+    """A degenerate rig (all cameras at the same position) has no
+    baseline scale to derive from; must raise rather than silently
+    return bounds=[near_floor, ~0]."""
+    eye = np.array([1.0, 2.0, 3.0])
+    target = np.array([0.0, 0.0, 5.0])
+    c2ws = np.stack([_camera_looking_at(eye, target) for _ in range(4)], axis=0)
+    with pytest.raises(ValueError, match="baseline"):
+        derive_baseline_bounds(c2ws)
+
+
+def test_derive_baseline_bounds_rejects_single_camera():
+    c2ws = _ring_of_cameras(np.zeros(3), n=1, radius=2.0)
+    with pytest.raises(ValueError, match="baseline"):
+        derive_baseline_bounds(c2ws)
+
+
+def test_derive_baseline_bounds_rejects_far_le_near():
+    """If far_factor * baseline <= near_floor the bounds are degenerate."""
+    c2ws = _ring_of_cameras(np.zeros(3), n=3, radius=0.005)   # baseline ~0.01
+    with pytest.raises(ValueError, match="near_floor"):
+        derive_baseline_bounds(c2ws, near_floor=1.0, far_factor=2.0)
 
 
 # ---------- init_point_cloud_in_frustums ----------
@@ -329,6 +396,10 @@ def test_writer_emits_points3d_ply_inside_camera_frustums(tmp_path):
         init_points3d_ply=True,
         init_n_pts=2_000,
         init_seed=0,
+        # Pin to LLFF for this test -- the assertion below uses meta.bounds
+        # as the per-camera depth window. The baseline-derived path is
+        # exercised by test_writer_baseline_bounds_ignores_meta_bounds.
+        init_bounds_source="llff",
     )
     write_timestep(0, _FakeScene(), options)
     ply_path = tmp_path / "timestep_00000" / "points3d.ply"
@@ -353,6 +424,111 @@ def test_writer_emits_points3d_ply_inside_camera_frustums(tmp_path):
     assert n_in == pos.shape[0], (
         f"emitted ply has {pos.shape[0] - n_in} points outside every camera frustum"
     )
+
+
+def _make_fake_scene(c2ws_opencv: np.ndarray, bounds: np.ndarray,
+                     H: int, W: int, fovx: float):
+    """Construct a DMV-shaped fake scene (R/T in 2DGS convention, etc.)
+    around a given OpenCV c2w stack. Returned object satisfies the
+    interface read by write_scene.write_timestep."""
+    w2c = np.linalg.inv(c2ws_opencv)
+    R_stored = np.transpose(w2c[:, :3, :3], axes=(0, 2, 1))
+    T_stored = w2c[:, :3, 3]
+    n = c2ws_opencv.shape[0]
+
+    class _FakeMeta:
+        n_cams = n
+        height = H
+        width = W
+        FovX = np.full(n, fovx)
+        R = R_stored
+        T = T_stored
+        bounds = None
+    _FakeMeta.bounds = bounds
+
+    class _FakeScene:
+        meta = _FakeMeta()
+        def read_timestep(self, t):
+            return {
+                "rgb": np.zeros((n, H, W, 3), dtype=np.uint8),
+                "fg_mask": np.zeros((n, H, W), dtype=bool),
+            }
+    return _FakeScene()
+
+
+def test_writer_baseline_bounds_ignores_meta_bounds(tmp_path):
+    """The bug the baseline-bounds path fixes: poses_bounds.npy reports
+    off-scale near/far while the scene actually sits at depths derived
+    from the rig baseline. The test simulates the DMV scene14 condition
+    (LLFF bounds 30-280 but trained content is closer to ~6 = 2x rig
+    baseline) and checks the writer emits points in [near_floor,
+    far_factor * baseline] rather than at LLFF depths.
+    """
+    pytest.importorskip("h5py")
+    plyfile = pytest.importorskip("plyfile")
+    from tracking.data.write_scene import WriteOptions, write_timestep
+    PlyData = plyfile.PlyData
+
+    target = np.array([0.0, 0.0, 5.0])
+    c2ws = _ring_of_cameras(target, n=6, radius=3.0, height=0.0)  # baseline = 6
+    H, W = 60, 80
+    fovx = math.radians(60.0)
+    # Deliberately off-scale LLFF bounds. If the writer used these,
+    # init points would land at depth 30-280 -- far from where the
+    # 2DGS optimizer can pull them.
+    llff_bounds = np.tile(np.array([30.0, 280.0]), (6, 1))
+    scene = _make_fake_scene(c2ws, llff_bounds, H, W, fovx)
+
+    options = WriteOptions(
+        work_root=str(tmp_path),
+        write_masks=False,
+        init_points3d_ply=True,
+        init_n_pts=4_000,
+        init_seed=0,
+        init_bounds_source="baseline",
+        init_far_factor=2.0,
+        init_near_floor=0.01,
+    )
+    write_timestep(0, scene, options)
+    ply = PlyData.read(str(tmp_path / "timestep_00000" / "points3d.ply"))
+    pos = np.stack([ply.elements[0]["x"], ply.elements[0]["y"], ply.elements[0]["z"]],
+                   axis=1).astype(np.float64)
+
+    # Per-camera depth of each emitted point. For the baseline path,
+    # every point should be at depth in [near_floor, 2 * baseline] =
+    # [0.01, 12] relative to some camera, NOT in the LLFF 30-280 range.
+    positions = c2ws[:, :3, 3]
+    forwards = c2ws[:, :3, 2]
+    # (n_pts, n_cams)
+    depths = ((pos[:, None, :] - positions[None, :, :]) *
+              forwards[None, :, :]).sum(axis=-1)
+    # The min depth (across cameras) for each point gives "how deep this
+    # point sits in the rig". With baseline-derived bounds, this should
+    # NEVER exceed ~12 + small slack. If the writer were honouring
+    # LLFF bounds, the typical value would be 30+.
+    closest_depth = depths.max(axis=1)   # most-forward depth per point
+    assert closest_depth.max() < 13.0, (
+        f"max forward-depth {closest_depth.max():.2f} exceeds 2*baseline=12; "
+        "writer appears to be using LLFF bounds, not baseline-derived bounds"
+    )
+
+
+def test_writer_unknown_bounds_source_raises(tmp_path):
+    pytest.importorskip("h5py")
+    from tracking.data.write_scene import WriteOptions, write_timestep
+
+    c2ws = _ring_of_cameras(np.array([0.0, 0.0, 5.0]), n=4, radius=2.0)
+    scene = _make_fake_scene(c2ws, np.tile([1.0, 10.0], (4, 1)),
+                              H=30, W=40, fovx=math.radians(60.0))
+    options = WriteOptions(
+        work_root=str(tmp_path),
+        write_masks=False,
+        init_points3d_ply=True,
+        init_n_pts=100,
+        init_bounds_source="garbage",
+    )
+    with pytest.raises(ValueError, match="init_bounds_source"):
+        write_timestep(0, scene, options)
 
 
 def test_writer_skips_points3d_ply_when_disabled(tmp_path):

@@ -87,16 +87,75 @@ def compute_camera_convergence(
     return X.astype(np.float64), rmse
 
 
-def _max_camera_baseline(positions: np.ndarray) -> float:
-    """Max pairwise distance between camera centres.
+def camera_baseline(c2w_matrices: np.ndarray) -> float:
+    """Max pairwise distance between camera centres, in world units.
 
-    Used as a spread floor: the init cloud must be at least as wide as
-    the camera rig so every camera can see *some* of it through its
-    frustum.
+    A rig-wide scalar that's a good proxy for the spatial scale of
+    the content the cameras can observe: a scene noticeably larger
+    than ``camera_baseline`` would have most of itself outside every
+    camera's frustum; a scene much smaller than the baseline isn't
+    being multi-viewed meaningfully. Used by ``derive_baseline_bounds``
+    as the depth-range proxy when the LLFF ``poses_bounds.npy`` near/far
+    values are at a different scale than the actual scene content (as
+    we observed empirically on DMV scene14, where LLFF reported
+    near/far in the 30-300 range but the trained Gaussians live at
+    depth ~0.1-5 from the cameras).
     """
-    # (N, N, 3) diffs; bottleneck is the outer product but N is small.
+    if c2w_matrices.ndim != 3 or c2w_matrices.shape[1:] != (4, 4):
+        raise ValueError(f"expected (N, 4, 4) c2w; got {c2w_matrices.shape}")
+    positions = c2w_matrices[:, :3, 3]
     diffs = positions[:, None, :] - positions[None, :, :]
     return float(np.linalg.norm(diffs, axis=-1).max())
+
+
+def derive_baseline_bounds(
+    c2w_matrices: np.ndarray,
+    near_floor: float = 0.01,
+    far_factor: float = 2.0,
+) -> np.ndarray:
+    """Per-camera (near, far) bounds derived from the rig baseline.
+
+    Returns ``(N, 2)`` rows all equal to
+    ``[near_floor, far_factor * camera_baseline]``. The bounds are
+    uniform across cameras because the baseline is a rig-wide quantity
+    -- per-camera variation in init depth range would require trusting
+    per-camera depth information, which is precisely the assumption
+    that broke on scene14.
+
+    Use this as the bounds input to ``init_point_cloud_in_frustums``
+    when ``poses_bounds.npy``'s near/far columns are at a different
+    scale than the actual scene content.
+
+    Args:
+        c2w_matrices: (N, 4, 4) OpenCV c2w.
+        near_floor: small positive depth; default 0.01.
+        far_factor: multiplier on the baseline to obtain ``far``.
+            Default 2.0 gives an init region roughly 2x the rig
+            spread; on a scene where the cameras span ~6 units, this
+            puts init at depths up to 12, comfortably covering
+            scenes at depth ~5.
+
+    Raises:
+        ValueError: if the rig is degenerate (single camera or all
+            cameras co-located), since a baseline of 0 leaves no
+            principled scale to derive bounds from.
+    """
+    baseline = camera_baseline(c2w_matrices)
+    if baseline < 1e-6:
+        raise ValueError(
+            f"camera baseline is {baseline:.6g} (essentially zero); cannot "
+            "derive init bounds from a single-camera or co-located rig. "
+            "Pass init_bounds_source='llff' with explicit near/far overrides, "
+            "or fix the rig configuration."
+        )
+    far = far_factor * baseline
+    if far <= near_floor:
+        raise ValueError(
+            f"baseline-derived far ({far:.4f}) <= near_floor ({near_floor:.4f}); "
+            "increase far_factor or lower near_floor."
+        )
+    N = c2w_matrices.shape[0]
+    return np.tile(np.array([near_floor, far]), (N, 1)).astype(np.float64)
 
 
 def init_point_cloud_in_frustums(

@@ -52,6 +52,8 @@ from PIL import Image
 
 from .dmv_loader import DMVScene
 from .init_point_cloud import (
+    camera_baseline,
+    derive_baseline_bounds,
     init_point_cloud_in_frustums,
     write_points3d_ply,
 )
@@ -93,6 +95,23 @@ class WriteOptions:
     init_near_floor: float = 1e-2
     init_far_ceiling: Optional[float] = None
     init_seed: int = 0
+    # Where the per-camera (near, far) frustum bounds come from.
+    #   "baseline" -- derive bounds from the rig's max pairwise camera
+    #                 distance (see init_point_cloud.derive_baseline_bounds).
+    #                 Default because empirically the LLFF poses_bounds.npy
+    #                 near/far values on DMV-style scenes can be off-scale
+    #                 (we observed near=30, far=280 on scene14 while trained
+    #                 Gaussians lived at depth ~0.1-5), which spawns init
+    #                 points where the scene isn't.
+    #   "llff"     -- trust meta.bounds (poses_bounds.npy cols 15:17). Use
+    #                 when those values are known to be in the same units
+    #                 as the camera positions.
+    init_bounds_source: str = "baseline"
+    # Multiplier on the camera baseline that becomes the per-camera ``far``
+    # when init_bounds_source == "baseline". 2.0 covers scenes up to twice
+    # the rig spread; raise this if your content sits unusually far behind
+    # the cameras' look-at region.
+    init_far_factor: float = 2.0
 
 
 def _opencv_c2w_to_opengl(c2w_opencv: np.ndarray) -> np.ndarray:
@@ -243,32 +262,61 @@ def write_timestep(t: int, scene: DMVScene, options: WriteOptions) -> str:
     # Always overwrite on re-run so a fresh Stage A overrides any
     # stale init from a previous (random-fallback) run.
     if options.init_points3d_ply:
-        # Diagnostic: dump the RAW per-camera near/far from poses_bounds
-        # *before* near_floor / far_ceiling sanitisation. Lets you spot
-        # LLFF files with bad bounds (negative near, far <= near, or
-        # absurd magnitudes that suggest the file is in different
-        # units than the camera positions) at Stage A time -- before
-        # any Stage B reconstruction wastes compute on a bad init.
+        # Always log the RAW LLFF per-camera near/far so that an off-scale
+        # poses_bounds.npy is visible at Stage A time -- even when we then
+        # ignore it (bounds_source == "baseline"). Spotting "LLFF says
+        # near=30 but baseline is 6" once is what motivates picking
+        # init_bounds_source intentionally.
         raw_near = meta.bounds[:, 0].astype(np.float64)
         raw_far = meta.bounds[:, 1].astype(np.float64)
         print(
-            f"[write_scene] timestep_{t:05d}: raw bounds from poses_bounds.npy: "
+            f"[write_scene] timestep_{t:05d}: LLFF poses_bounds.npy: "
             f"near=[{raw_near.min():.3g}, {raw_near.max():.3g}] median={np.median(raw_near):.3g}, "
             f"far=[{raw_far.min():.3g}, {raw_far.max():.3g}] median={np.median(raw_far):.3g}"
         )
-        if (raw_near <= 0).any():
-            n_bad = int((raw_near <= 0).sum())
-            print(
-                f"[write_scene]   WARN: {n_bad}/{meta.n_cams} cameras have near <= 0; "
-                f"clamped to init_near_floor={options.init_near_floor}. "
-                "If this is wrong for your data, pass --init-near-floor or fix poses_bounds."
+
+        # Dispatch on bounds source. "baseline" derives per-camera (near,
+        # far) from the rig's max pairwise camera distance; "llff" trusts
+        # meta.bounds. The DMV scene14 debugging session that motivated
+        # this lives in tracking/data/init_point_cloud.py's module
+        # docstring -- see also the camera_baseline / derive_baseline_bounds
+        # docstrings for the why.
+        if options.init_bounds_source == "baseline":
+            baseline = camera_baseline(c2w_opencv)
+            bounds_used = derive_baseline_bounds(
+                c2w_opencv,
+                near_floor=options.init_near_floor,
+                far_factor=options.init_far_factor,
             )
-        if (raw_far <= raw_near).any():
-            n_bad = int((raw_far <= raw_near).sum())
             print(
-                f"[write_scene]   WARN: {n_bad}/{meta.n_cams} cameras have far <= near; "
-                "the writer extends those by 1e-3 to avoid a degenerate frustum, but the "
-                "init for those cameras will be a paper-thin shell -- check poses_bounds."
+                f"[write_scene]   bounds_source=baseline: camera_baseline={baseline:.4g}, "
+                f"far_factor={options.init_far_factor:.3g} -> "
+                f"chosen near={bounds_used[0, 0]:.3g}, far={bounds_used[0, 1]:.3g} "
+                "(uniform across cameras)"
+            )
+        elif options.init_bounds_source == "llff":
+            bounds_used = meta.bounds
+            if (raw_near <= 0).any():
+                n_bad = int((raw_near <= 0).sum())
+                print(
+                    f"[write_scene]   WARN: {n_bad}/{meta.n_cams} cameras have near <= 0; "
+                    f"clamped to init_near_floor={options.init_near_floor}. "
+                    "If this is wrong for your data, pass --init-near-floor or fix poses_bounds."
+                )
+            if (raw_far <= raw_near).any():
+                n_bad = int((raw_far <= raw_near).sum())
+                print(
+                    f"[write_scene]   WARN: {n_bad}/{meta.n_cams} cameras have far <= near; "
+                    "the writer extends those by 1e-3 to avoid a degenerate frustum, but the "
+                    "init for those cameras will be a paper-thin shell -- check poses_bounds."
+                )
+            print(
+                f"[write_scene]   bounds_source=llff: using poses_bounds.npy values as-is"
+            )
+        else:
+            raise ValueError(
+                f"unknown init_bounds_source={options.init_bounds_source!r}; "
+                "expected 'baseline' or 'llff'"
             )
 
         # Per-camera FoVY derived from FoVX + image aspect (mirrors the
@@ -280,7 +328,7 @@ def write_timestep(t: int, scene: DMVScene, options: WriteOptions) -> str:
             c2w_matrices=c2w_opencv,
             fov_x=fov_x_per_cam,
             fov_y=fov_y_per_cam,
-            bounds=meta.bounds,
+            bounds=bounds_used,
             n_pts=options.init_n_pts,
             depth_distribution=options.init_depth_distribution,
             near_floor=options.init_near_floor,

@@ -70,11 +70,24 @@ def _build_parser() -> argparse.ArgumentParser:
                         "vanilla 3DGS-style flat depth (default); log = log-uniform, more "
                         "near-biased (only useful if your content sits near the camera and "
                         "uniform leaves the close-up region too sparse)")
+    p.add_argument("--init-bounds-source", choices=["baseline", "llff"], default="baseline",
+                   help="where the per-camera (near, far) frustum bounds come from. "
+                        "'baseline' (default) derives them from the rig's max pairwise camera "
+                        "distance (near=init_near_floor, far=init_far_factor*baseline). 'llff' "
+                        "trusts poses_bounds.npy cols 15:17. Default is baseline because we "
+                        "observed off-scale LLFF bounds on DMV scene14 (near=30, far=280 while "
+                        "trained Gaussians lived at depth ~0.1-5).")
+    p.add_argument("--init-far-factor", type=float, default=2.0,
+                   help="when --init-bounds-source=baseline: multiplier on the camera baseline "
+                        "to obtain the per-camera 'far' depth (default 2.0). Raise if your "
+                        "scene content sits unusually far behind the cameras' look-at region.")
     p.add_argument("--init-near-floor", type=float, default=1e-2,
-                   help="floor for per-camera near depth (some LLFF files store near <= 0)")
+                   help="floor for per-camera near depth (some LLFF files store near <= 0; "
+                        "also used directly as the per-camera near when --init-bounds-source=baseline)")
     p.add_argument("--init-far-ceiling", type=float, default=None,
                    help="optional cap on per-camera far depth; set to ignore unrealistic LLFF "
-                        "far values that would spray init points at irrelevant depths")
+                        "far values that would spray init points at irrelevant depths "
+                        "(only effective when --init-bounds-source=llff)")
     p.add_argument("--init-seed", type=int, default=0)
 
     # Semantic preprocessing
@@ -120,6 +133,8 @@ def main(argv: list[str] | None = None) -> int:
             init_near_floor=args.init_near_floor,
             init_far_ceiling=args.init_far_ceiling,
             init_seed=args.init_seed,
+            init_bounds_source=args.init_bounds_source,
+            init_far_factor=args.init_far_factor,
         )
         dirs = write_timesteps(scene, timesteps, wopts)
         print(f"[build_dataset] wrote {len(dirs)} timestep dirs under {args.work_root}")
