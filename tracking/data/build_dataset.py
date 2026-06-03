@@ -55,6 +55,28 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-masks", action="store_true",
                    help="skip writing per-camera fg/bg mask PNGs")
 
+    # Init point cloud (avoids the [-1.3, 1.3]^3 random-init mismatch
+    # that otherwise produces bimodal "training-converges-or-doesn't"
+    # failures on scenes whose content doesn't sit at the world origin).
+    p.add_argument("--no-init-points3d", action="store_true",
+                   help="skip writing points3d.ply; falls back to the Blender reader's random "
+                        "init in [-1.3, 1.3]^3 (scene/dataset_readers.py:279). Use only if your "
+                        "scene actually is centred at the world origin.")
+    p.add_argument("--init-n-pts", type=int, default=100_000,
+                   help="number of init points sampled across the cameras' frustums "
+                        "(default 100k, same count as the Blender reader's random fallback)")
+    p.add_argument("--init-depth-distribution", choices=["uniform", "log"], default="uniform",
+                   help="how to sample depths within each camera's [near, far]. uniform = "
+                        "vanilla 3DGS-style flat depth (default); log = log-uniform, more "
+                        "near-biased (only useful if your content sits near the camera and "
+                        "uniform leaves the close-up region too sparse)")
+    p.add_argument("--init-near-floor", type=float, default=1e-2,
+                   help="floor for per-camera near depth (some LLFF files store near <= 0)")
+    p.add_argument("--init-far-ceiling", type=float, default=None,
+                   help="optional cap on per-camera far depth; set to ignore unrealistic LLFF "
+                        "far values that would spray init points at irrelevant depths")
+    p.add_argument("--init-seed", type=int, default=0)
+
     # Semantic preprocessing
     p.add_argument("--skip-semantic", action="store_true",
                    help="skip SAM3 + SigLIP2 preprocessing entirely (use for the single-timestep "
@@ -92,6 +114,12 @@ def main(argv: list[str] | None = None) -> int:
             work_root=args.work_root,
             write_masks=not args.no_masks,
             max_image_side=args.max_image_side,
+            init_points3d_ply=not args.no_init_points3d,
+            init_n_pts=args.init_n_pts,
+            init_depth_distribution=args.init_depth_distribution,
+            init_near_floor=args.init_near_floor,
+            init_far_ceiling=args.init_far_ceiling,
+            init_seed=args.init_seed,
         )
         dirs = write_timesteps(scene, timesteps, wopts)
         print(f"[build_dataset] wrote {len(dirs)} timestep dirs under {args.work_root}")

@@ -45,12 +45,16 @@ import math
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Optional
 
 import numpy as np
 from PIL import Image
 
 from .dmv_loader import DMVScene
+from .init_point_cloud import (
+    init_point_cloud_in_frustums,
+    write_points3d_ply,
+)
 
 
 # Below this fractional spread we don't bother warning -- avoids noise
@@ -74,6 +78,21 @@ class WriteOptions:
     # can't represent it." If you hit this on a real scene, the
     # principled fix is a COLMAP-style writer with per-camera intrinsics.
     max_fov_spread_frac: float = 0.05
+    # Seed each per-timestep scene with a points3d.ply whose points are
+    # sampled uniformly inside the union of the cameras' frustums
+    # (per-camera near/far from the LLFF poses_bounds, per-camera FoV
+    # from the JSON). Without this, the Blender reader at
+    # scene/dataset_readers.py:279 falls back to uniform random init in
+    # [-1.3, 1.3]^3 -- catastrophically wrong for DMV-style scenes
+    # whose content sits far from the world origin. See
+    # tracking.data.init_point_cloud and the Jun 2026 debugging session
+    # for the bimodal-training failure this fixes.
+    init_points3d_ply: bool = True
+    init_n_pts: int = 100_000
+    init_depth_distribution: str = "uniform"
+    init_near_floor: float = 1e-2
+    init_far_ceiling: Optional[float] = None
+    init_seed: int = 0
 
 
 def _opencv_c2w_to_opengl(c2w_opencv: np.ndarray) -> np.ndarray:
@@ -214,6 +233,80 @@ def write_timestep(t: int, scene: DMVScene, options: WriteOptions) -> str:
         json.dump(train_doc, f, indent=2)
     with open(os.path.join(dest, "transforms_test.json"), "w") as f:
         json.dump(test_doc, f, indent=2)
+
+    # ---- points3d.ply (init seed for the Blender reader) ----
+    # Sample uniformly inside the union of camera frustums using the
+    # per-camera near/far from poses_bounds.npy. Without this, the
+    # Blender reader at scene/dataset_readers.py:279 falls back to
+    # uniform random init in [-1.3, 1.3]^3 -- wrong for any scene
+    # whose content doesn't happen to sit at the world origin.
+    # Always overwrite on re-run so a fresh Stage A overrides any
+    # stale init from a previous (random-fallback) run.
+    if options.init_points3d_ply:
+        # Diagnostic: dump the RAW per-camera near/far from poses_bounds
+        # *before* near_floor / far_ceiling sanitisation. Lets you spot
+        # LLFF files with bad bounds (negative near, far <= near, or
+        # absurd magnitudes that suggest the file is in different
+        # units than the camera positions) at Stage A time -- before
+        # any Stage B reconstruction wastes compute on a bad init.
+        raw_near = meta.bounds[:, 0].astype(np.float64)
+        raw_far = meta.bounds[:, 1].astype(np.float64)
+        print(
+            f"[write_scene] timestep_{t:05d}: raw bounds from poses_bounds.npy: "
+            f"near=[{raw_near.min():.3g}, {raw_near.max():.3g}] median={np.median(raw_near):.3g}, "
+            f"far=[{raw_far.min():.3g}, {raw_far.max():.3g}] median={np.median(raw_far):.3g}"
+        )
+        if (raw_near <= 0).any():
+            n_bad = int((raw_near <= 0).sum())
+            print(
+                f"[write_scene]   WARN: {n_bad}/{meta.n_cams} cameras have near <= 0; "
+                f"clamped to init_near_floor={options.init_near_floor}. "
+                "If this is wrong for your data, pass --init-near-floor or fix poses_bounds."
+            )
+        if (raw_far <= raw_near).any():
+            n_bad = int((raw_far <= raw_near).sum())
+            print(
+                f"[write_scene]   WARN: {n_bad}/{meta.n_cams} cameras have far <= near; "
+                "the writer extends those by 1e-3 to avoid a degenerate frustum, but the "
+                "init for those cameras will be a paper-thin shell -- check poses_bounds."
+            )
+
+        # Per-camera FoVY derived from FoVX + image aspect (mirrors the
+        # Blender reader at scene/dataset_readers.py:236).
+        fov_x_per_cam = meta.FovX.astype(np.float64)
+        focal_per_cam = float(meta.width) / (2.0 * np.tan(fov_x_per_cam / 2.0))
+        fov_y_per_cam = 2.0 * np.arctan(float(meta.height) / (2.0 * focal_per_cam))
+        xyz, rgb, init_meta = init_point_cloud_in_frustums(
+            c2w_matrices=c2w_opencv,
+            fov_x=fov_x_per_cam,
+            fov_y=fov_y_per_cam,
+            bounds=meta.bounds,
+            n_pts=options.init_n_pts,
+            depth_distribution=options.init_depth_distribution,
+            near_floor=options.init_near_floor,
+            far_ceiling=options.init_far_ceiling,
+            rng=np.random.default_rng(options.init_seed),
+        )
+        write_points3d_ply(
+            os.path.join(dest, "points3d.ply"),
+            xyz,
+            (rgb * 255).astype(np.uint8),
+        )
+        bbox_min = init_meta["xyz_min"]
+        bbox_max = init_meta["xyz_max"]
+        bbox_med = init_meta["xyz_median"]
+        near_lo, near_hi = float(init_meta["near_used"].min()), float(init_meta["near_used"].max())
+        far_lo, far_hi = float(init_meta["far_used"].min()), float(init_meta["far_used"].max())
+        print(
+            f"[write_scene] timestep_{t:05d}: seeded points3d.ply with "
+            f"{xyz.shape[0]} frustum-sampled points; "
+            f"per-cam near in [{near_lo:.3g}, {near_hi:.3g}], "
+            f"far in [{far_lo:.3g}, {far_hi:.3g}]; "
+            f"bbox x=[{bbox_min[0]:+.2f}, {bbox_max[0]:+.2f}] "
+            f"y=[{bbox_min[1]:+.2f}, {bbox_max[1]:+.2f}] "
+            f"z=[{bbox_min[2]:+.2f}, {bbox_max[2]:+.2f}]; "
+            f"median ({bbox_med[0]:+.2f}, {bbox_med[1]:+.2f}, {bbox_med[2]:+.2f})"
+        )
 
     return dest
 
