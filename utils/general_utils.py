@@ -170,8 +170,10 @@ def colormap(img, cmap='jet'):
     fig.colorbar(im, ax=ax)
     fig.tight_layout()
     fig.canvas.draw()
-    data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    # matplotlib >=3.10 removed FigureCanvasAgg.tostring_rgb; buffer_rgba is
+    # available across versions. Read RGBA, then drop the alpha channel.
+    data = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+    data = data.reshape(fig.canvas.get_width_height()[::-1] + (4,))[..., :3]
     img = torch.from_numpy(data / 255.).float().permute(2,0,1)
     plt.close()
     return img
