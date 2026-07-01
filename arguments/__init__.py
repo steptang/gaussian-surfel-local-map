@@ -95,6 +95,10 @@ class OptimizationParams(ParamGroup):
         self.lambda_dssim = 0.2
         self.lambda_dist = 0.0
         self.lambda_normal = 0.05
+        # RGB-D depth supervision: L1 between rendered surf_depth and sensor depth
+        # on valid pixels. 0 = off (RGB-only). Requires per-camera gt_depth (see
+        # scene readers / camera_utils). Metric depth must match the pose scale.
+        self.lambda_depth = 0.0
         self.opacity_cull = 0.05
 
         # Semantic-feature loss. lambda_semantic = 0 disables the loss entirely

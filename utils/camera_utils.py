@@ -41,6 +41,22 @@ def _load_region_embeds(embeds_path):
     arr = np.load(embeds_path)
     return torch.from_numpy(arr.astype(np.float32))
 
+
+def _load_depth(depth_path, resolution):
+    """Load a per-frame metric depth map (.npy, H x W float) and resize to (W, H).
+
+    Returns (1, H, W) float32 tensor; 0 = no measurement. Uses nearest resize so
+    depth discontinuities aren't blurred (and invalid 0s aren't averaged in).
+    """
+    if depth_path is None:
+        return None
+    arr = np.load(depth_path).astype(np.float32)
+    t = torch.from_numpy(arr)[None, None]            # (1, 1, H, W)
+    W, H = resolution
+    if (t.shape[3], t.shape[2]) != (W, H):
+        t = torch.nn.functional.interpolate(t, size=(H, W), mode="nearest")
+    return t[0]                                      # (1, H, W)
+
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
 
@@ -74,12 +90,14 @@ def loadCam(args, id, cam_info, resolution_scale):
 
     region_map = _load_region_map(getattr(cam_info, "regions_path", None), resolution)
     region_embeds = _load_region_embeds(getattr(cam_info, "embeds_path", None))
+    gt_depth = _load_depth(getattr(cam_info, "depth_path", None), resolution)
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
-                  region_map=region_map, region_embeds=region_embeds)
+                  region_map=region_map, region_embeds=region_embeds, gt_depth=gt_depth,
+                  px=getattr(cam_info, "px", 0.5), py=getattr(cam_info, "py", 0.5))
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

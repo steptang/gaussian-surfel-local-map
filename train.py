@@ -120,8 +120,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             sem_loss = torch.tensor(0.0, device="cuda")
         semantic_loss_term = opt.lambda_semantic * sem_loss
 
+        # Depth supervision (RGB-D): L1 between rendered depth and sensor depth on
+        # valid pixels only (gt_depth == 0 means no measurement). Off unless
+        # lambda_depth > 0 AND this camera carries a gt_depth map.
+        if opt.lambda_depth > 0 and getattr(viewpoint_cam, "gt_depth", None) is not None:
+            gt_depth = viewpoint_cam.gt_depth.cuda()
+            valid = gt_depth > 0
+            depth_loss = (torch.abs(render_pkg["surf_depth"] - gt_depth)[valid].mean()
+                          if valid.any() else torch.tensor(0.0, device="cuda"))
+        else:
+            depth_loss = torch.tensor(0.0, device="cuda")
+        depth_loss_term = opt.lambda_depth * depth_loss
+
         # loss
-        total_loss = loss + dist_loss + normal_loss + semantic_loss_term
+        total_loss = loss + dist_loss + normal_loss + semantic_loss_term + depth_loss_term
 
         total_loss.backward()
 

@@ -38,6 +38,9 @@ class CameraInfo(NamedTuple):
     # preprocessing has been run for this scene.
     regions_path: str = None    # path to <stem>_regions.png  (uint16 region IDs)
     embeds_path: str = None     # path to <stem>_embeds.npy   (R+1, K_target) float16
+    depth_path: str = None      # path to depth/<stem>.npy    (metric float depth), RGB-D supervision
+    px: float = 0.5             # normalized principal point cx/W (0.5 = centered)
+    py: float = 0.5             # normalized principal point cy/H (0.5 = centered)
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -204,7 +207,16 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
-        fovx = contents["camera_angle_x"]
+        # Intrinsics: full pinhole (fl_x/fl_y/cx/cy/w/h) if provided, else single-FOV
+        # (camera_angle_x, centered principal point). Full form fixes fx!=fy and off-centre
+        # principal points (e.g. real RGB-D cameras like TUM).
+        full_intr = "fl_x" in contents
+        if full_intr:
+            W_meta, H_meta = contents["w"], contents["h"]
+            fl_x = contents["fl_x"]; fl_y = contents.get("fl_y", fl_x)
+            cx = contents.get("cx", W_meta / 2); cy = contents.get("cy", H_meta / 2)
+        else:
+            fovx = contents["camera_angle_x"]
 
         frames = contents["frames"]
         for idx, frame in enumerate(frames):
@@ -232,9 +244,12 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
             image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
 
-            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            FovY = fovy
-            FovX = fovx
+            if full_intr:
+                FovX = focal2fov(fl_x, W_meta); FovY = focal2fov(fl_y, H_meta)
+                px, py = cx / W_meta, cy / H_meta
+            else:
+                fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+                FovX = fovx; FovY = fovy; px = py = 0.5
 
             # Optional SAM3 + SigLIP2 artifacts. Look up the per-image
             # sibling files in <path>/<sam_dir>/<stem>_regions.png and
@@ -251,9 +266,16 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 if os.path.exists(rp) and os.path.exists(ep):
                     regions_path, embeds_path = rp, ep
 
+            # Optional RGB-D depth: <path>/depth/<stem>.npy (metric float). Auto-detected.
+            depth_path = None
+            dp = os.path.join(path, "depth", f"{image_name}.npy")
+            if os.path.exists(dp):
+                depth_path = dp
+
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
-                            regions_path=regions_path, embeds_path=embeds_path))
+                            regions_path=regions_path, embeds_path=embeds_path, depth_path=depth_path,
+                            px=px, py=py))
 
     return cam_infos
 

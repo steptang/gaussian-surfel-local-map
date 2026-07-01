@@ -48,7 +48,7 @@ def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
     Rt = np.linalg.inv(C2W)
     return np.float32(Rt)
 
-def getProjectionMatrix(znear, zfar, fovX, fovY):
+def getProjectionMatrix(znear, zfar, fovX, fovY, px=0.5, py=0.5):
     tanHalfFovY = math.tan((fovY / 2))
     tanHalfFovX = math.tan((fovX / 2))
 
@@ -63,8 +63,13 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
 
     P[0, 0] = 2.0 * znear / (right - left)
     P[1, 1] = 2.0 * znear / (top - bottom)
-    P[0, 2] = (right + left) / (right - left)
-    P[1, 2] = (top + bottom) / (top - bottom)
+    # Principal-point offset: px, py are the normalized principal point (cx/W, cy/H);
+    # 0.5 = centered -> shift 0 (backward compatible). Shifts the frustum so the optical
+    # axis passes through (cx, cy) instead of the image centre. NOTE: only the projected
+    # Gaussian *centres* honour this (the rasterizer's 2D-covariance path still assumes a
+    # centered principal point). If a full-intrinsics scene renders shifted, flip these signs.
+    P[0, 2] = 1.0 - 2.0 * px
+    P[1, 2] = 1.0 - 2.0 * py
     P[3, 2] = z_sign
     P[2, 2] = z_sign * zfar / (zfar - znear)
     P[2, 3] = -(zfar * znear) / (zfar - znear)
