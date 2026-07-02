@@ -193,6 +193,108 @@ def generate_path(viewpoint_cameras, n_frames=480):
 
   return traj
 
+
+def _slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
+  """Spherical linear interpolation between two unit quaternions (w, x, y, z)."""
+  dot = np.dot(q0, q1)
+  if dot < 0.0:  # take the shorter arc
+    q1 = -q1
+    dot = -dot
+  if dot > 0.9995:  # nearly parallel -> linear interp
+    q = q0 + t * (q1 - q0)
+    return q / np.linalg.norm(q)
+  theta_0 = np.arccos(dot)
+  theta = theta_0 * t
+  q2 = q1 - q0 * dot
+  q2 = q2 / np.linalg.norm(q2)
+  return q0 * np.cos(theta) + q2 * np.sin(theta)
+
+
+def _rotmat_to_quat(R: np.ndarray) -> np.ndarray:
+  """3x3 rotation matrix -> quaternion (w, x, y, z)."""
+  tr = np.trace(R)
+  if tr > 0:
+    s = np.sqrt(tr + 1.0) * 2
+    w = 0.25 * s
+    x = (R[2, 1] - R[1, 2]) / s
+    y = (R[0, 2] - R[2, 0]) / s
+    z = (R[1, 0] - R[0, 1]) / s
+  elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+    s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+    w = (R[2, 1] - R[1, 2]) / s
+    x = 0.25 * s
+    y = (R[0, 1] + R[1, 0]) / s
+    z = (R[0, 2] + R[2, 0]) / s
+  elif R[1, 1] > R[2, 2]:
+    s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+    w = (R[0, 2] - R[2, 0]) / s
+    x = (R[0, 1] + R[1, 0]) / s
+    y = 0.25 * s
+    z = (R[1, 2] + R[2, 1]) / s
+  else:
+    s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+    w = (R[1, 0] - R[0, 1]) / s
+    x = (R[0, 2] + R[2, 0]) / s
+    y = (R[1, 2] + R[2, 1]) / s
+    z = 0.25 * s
+  return np.array([w, x, y, z])
+
+
+def _quat_to_rotmat(q: np.ndarray) -> np.ndarray:
+  """Quaternion (w, x, y, z) -> 3x3 rotation matrix."""
+  w, x, y, z = q / np.linalg.norm(q)
+  return np.array([
+      [1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y)],
+      [2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+      [2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)],
+  ])
+
+
+def generate_traj_path(viewpoint_cameras, n_frames=240):
+  """Fly-through that follows the ACTUAL camera trajectory (in order).
+
+  Unlike ``generate_path`` (which fits a synthetic inward-facing ellipse orbit
+  suited to object-centric captures), this walks along the recorded camera path,
+  smoothly interpolating position (linear) and orientation (slerp) between
+  consecutive frames. Correct for forward-translating / SLAM-style trajectories
+  such as TUM-RGBD, where the ellipse orbit points the camera at empty space.
+
+  Requires the cameras to be in temporal order (render.py builds the Scene with
+  shuffle=False, so getTrainCameras() preserves the transforms_*.json order).
+  """
+  cams = viewpoint_cameras
+  n_key = len(cams)
+  # camera-to-world for each keyframe
+  c2ws = [np.linalg.inv(np.asarray(cam.world_view_transform.T.cpu().numpy())) for cam in cams]
+  positions = np.array([c2w[:3, 3] for c2w in c2ws])
+  quats = np.array([_rotmat_to_quat(c2w[:3, :3]) for c2w in c2ws])
+
+  # resample the keyframe path to n_frames evenly-spaced samples
+  key_t = np.linspace(0.0, 1.0, n_key)
+  sample_t = np.linspace(0.0, 1.0, n_frames)
+
+  traj = []
+  for st in sample_t:
+    j = int(np.searchsorted(key_t, st, side='right') - 1)
+    j = max(0, min(j, n_key - 2))
+    local = 0.0 if key_t[j + 1] == key_t[j] else (st - key_t[j]) / (key_t[j + 1] - key_t[j])
+    pos = positions[j] * (1 - local) + positions[j + 1] * local
+    quat = _slerp(quats[j], quats[j + 1], local)
+
+    c2w = np.eye(4)
+    c2w[:3, :3] = _quat_to_rotmat(quat)
+    c2w[:3, 3] = pos
+
+    cam = copy.deepcopy(cams[0])
+    cam.image_height = int(cam.image_height / 2) * 2
+    cam.image_width = int(cam.image_width / 2) * 2
+    cam.world_view_transform = torch.from_numpy(np.linalg.inv(c2w).T).float().cuda()
+    cam.full_proj_transform = (cam.world_view_transform.unsqueeze(0).bmm(cam.projection_matrix.unsqueeze(0))).squeeze(0)
+    cam.camera_center = cam.world_view_transform.inverse()[3, :3]
+    traj.append(cam)
+
+  return traj
+
 def load_img(pth: str) -> np.ndarray:
   """Load an image and cast to float32."""
   with open(pth, 'rb') as f:

@@ -21,7 +21,7 @@ from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
 from utils.mesh_utils import GaussianExtractor, to_cam_open3d, post_process_mesh
-from utils.render_utils import generate_path, create_videos
+from utils.render_utils import generate_path, generate_traj_path, create_videos
 
 import open3d as o3d
 
@@ -36,6 +36,10 @@ if __name__ == "__main__":
     parser.add_argument("--skip_mesh", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--render_path", action="store_true")
+    parser.add_argument("--traj_mode", default="ellipse", type=str, choices=["ellipse", "interp"],
+                        help="Fly-through camera path: 'ellipse' = synthetic inward orbit "
+                             "(object-centric captures like garden/DMV); 'interp' = follow the "
+                             "actual recorded trajectory (forward-translating / SLAM captures like TUM-RGBD)")
     parser.add_argument("--voxel_size", default=-1.0, type=float, help='Mesh: voxel size for TSDF')
     parser.add_argument("--depth_trunc", default=-1.0, type=float, help='Mesh: Max depth range for TSDF')
     parser.add_argument("--sdf_trunc", default=-1.0, type=float, help='Mesh: truncation value for TSDF')
@@ -75,7 +79,10 @@ if __name__ == "__main__":
         traj_dir = os.path.join(args.model_path, 'traj', "ours_{}".format(scene.loaded_iter))
         os.makedirs(traj_dir, exist_ok=True)
         n_fames = 240
-        cam_traj = generate_path(scene.getTrainCameras(), n_frames=n_fames)
+        if args.traj_mode == "interp":
+            cam_traj = generate_traj_path(scene.getTrainCameras(), n_frames=n_fames)
+        else:
+            cam_traj = generate_path(scene.getTrainCameras(), n_frames=n_fames)
         gaussExtractor.reconstruction(cam_traj)
         gaussExtractor.export_image(traj_dir)
         create_videos(base_dir=traj_dir,
