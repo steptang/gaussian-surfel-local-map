@@ -16,6 +16,7 @@ import os
 import json
 import random
 import argparse
+import subprocess
 
 import numpy as np
 import torch
@@ -206,6 +207,15 @@ def main():
         "unified_deform": float(np.mean([unified_psnr(i, False) for i in hold])),
         "unified_rigid":  float(np.mean([unified_psnr(i, True) for i in hold])),
     }
+    try:
+        metrics["commit"] = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__))).decode().strip()
+    except Exception:
+        metrics["commit"] = "unknown"
+    metrics["config"] = {k: v for k, v in vars(args).items()}   # full run provenance
+    metrics["canonical_surfels"] = int(canonical.get_xyz.shape[0])
+    metrics["static_surfels"] = int(static.get_xyz.shape[0])
     json.dump(metrics, open(f"{args.out}/metrics.json", "w"), indent=2)
     print("METRICS:", json.dumps(metrics, indent=2))
 
