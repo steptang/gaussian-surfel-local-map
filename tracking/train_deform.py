@@ -129,9 +129,14 @@ def main():
     mlp_opt = torch.optim.Adam(field.parameters(), lr=5e-4)
 
     if args.multi_pose:
-        for grp in canonical.optimizer.param_groups:   # co-adapt canonical, but move positions slowly
+        # Co-adapt the canonical GENTLY: positions drift slowly + colour adapts, but FREEZE
+        # scale/rotation/opacity. Training those jointly with the deformation blows the surfels up
+        # into streaks (scale explosion) and fights the MLP's Δrotation -> keep the reconstruction's solidity.
+        for grp in canonical.optimizer.param_groups:
             if grp["name"] == "xyz":
                 grp["lr"] *= args.canonical_lr_scale
+            elif grp["name"] in ("scaling", "rotation", "opacity"):
+                grp["lr"] = 0.0
     else:
         rc.freeze(canonical)
 
