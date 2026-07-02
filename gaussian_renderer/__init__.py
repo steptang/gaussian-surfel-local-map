@@ -16,7 +16,7 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, render_semantic: bool = True):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, render_semantic: bool = True, means3D_override=None, rotations_override=None):
     """
     Render the scene.
 
@@ -58,7 +58,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz
+    # means3D_override / rotations_override let callers supply externally-computed geometry
+    # (e.g. a deformed/warped copy of the surfels) without mutating pc — used by the
+    # dynamics deformation rig. When None, fall back to the model's own parameters.
+    means3D = pc.get_xyz if means3D_override is None else means3D_override
     means2D = screenspace_points
     opacity = pc.get_opacity
 
@@ -81,8 +84,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         cov3D_precomp = (splat2world[:, [0,1,3]] @ world2pix[:,[0,1,3]]).permute(0,2,1).reshape(-1, 9) # column major
     else:
         scales = pc.get_scaling
-        rotations = pc.get_rotation
-    
+        rotations = pc.get_rotation if rotations_override is None else rotations_override
+
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     pipe.convert_SHs_python = False

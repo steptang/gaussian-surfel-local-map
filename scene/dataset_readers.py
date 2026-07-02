@@ -245,7 +245,16 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
             image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
 
-            if full_intr:
+            if "fl_x" in frame:
+                # Per-frame intrinsics override: a multi-camera capture (e.g. BEHAVE's 4 Kinects)
+                # can put fl_x/fl_y/cx/cy/w/h on each frame, since the cameras differ. Falls back
+                # to the file-level block below when absent.
+                W_f = frame.get("w", image.size[0]); H_f = frame.get("h", image.size[1])
+                flx_f = frame["fl_x"]; fly_f = frame.get("fl_y", flx_f)
+                cx_f = frame.get("cx", W_f / 2.0); cy_f = frame.get("cy", H_f / 2.0)
+                FovX = focal2fov(flx_f, W_f); FovY = focal2fov(fly_f, H_f)
+                px, py = cx_f / W_f, cy_f / H_f
+            elif full_intr:
                 FovX = focal2fov(fl_x, W_meta); FovY = focal2fov(fl_y, H_meta)
                 px, py = cx / W_meta, cy / H_meta
             else:
