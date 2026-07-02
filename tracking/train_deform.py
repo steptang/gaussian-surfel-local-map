@@ -80,9 +80,19 @@ def main():
     ap.add_argument("--time_freqs", type=int, default=5)
     ap.add_argument("--n_static", type=int, default=4, help="# spread timesteps fused for the static map")
     ap.add_argument("--multi_pose", action="store_true",
-                    help="jointly refine the canonical geometry with the deformation (else frozen canonical)")
+                    help="Lever A: jointly co-adapt the canonical geometry with the deformation "
+                         "(low LR; same surfel count). Else the canonical is frozen (single-pose).")
     ap.add_argument("--canonical_lr_scale", type=float, default=0.1)
+    ap.add_argument("--densify_canonical", action="store_true",
+                    help="Lever B: also GROW canonical coverage via densification during joint training "
+                         "(fills surfaces occluded at the reference pose). Implies --multi_pose.")
+    ap.add_argument("--densify_from", type=int, default=500)
+    ap.add_argument("--densify_interval", type=int, default=200)
+    ap.add_argument("--densify_until_frac", type=float, default=0.6,
+                    help="stop densifying after this fraction of deform_iters (let it settle at the end)")
     args = ap.parse_args()
+    if args.densify_canonical:
+        args.multi_pose = True          # densification is only meaningful on a trainable canonical
     os.makedirs(f"{args.out}/frames", exist_ok=True)
 
     dataset, opt, pipe = _fork_params()
@@ -126,13 +136,16 @@ def main():
         rc.freeze(canonical)
 
     nbr = knn_indices(canonical.get_xyz, k=8)
-    print(f"training deformation (multi_pose={args.multi_pose})")
+    densify_until = int(args.deform_iters * args.densify_until_frac)
+    print(f"training deformation (multi_pose={args.multi_pose}, densify_canonical={args.densify_canonical})")
     for it in range(1, args.deform_iters + 1):
         ti = random.choice(train); t = TS[ti]["t"]
         xyz_def, rot_def, dpos, daa = _warp(canonical, field, coarse[ti], t, False, args.multi_pose)
         loss = 0.0
+        pkgs = []
         for cam in TS[ti]["cams"]:
             pkg = render(cam, canonical, pipe, bg, means3D_override=xyz_def, rotations_override=rot_def)
+            pkgs.append(pkg)
             img, dep = pkg["render"], pkg["surf_depth"]
             gt = cam.original_image.cuda(); mk = PMASK[(ti, cam.image_name)]
             Ll1 = (torch.abs(img - gt) * mk).sum() / (mk.sum() * 3 + 1e-8)
@@ -145,6 +158,16 @@ def main():
         if nbr.shape[0] == dpos.shape[0]:
             loss = loss + args.lambda_rigid * local_rigidity_loss(dpos, nbr)
         loss.backward()
+        # --- Lever B: grow canonical coverage via densification (from the deformed-render gradients) ---
+        if args.densify_canonical and it < densify_until:
+            with torch.no_grad():
+                for pkg in pkgs:
+                    vis, radii = pkg["visibility_filter"], pkg["radii"]
+                    canonical.max_radii2D[vis] = torch.max(canonical.max_radii2D[vis], radii[vis])
+                    canonical.add_densification_stats(pkg["viewspace_points"], vis)
+                if it > args.densify_from and it % args.densify_interval == 0:
+                    canonical.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, extent, 20)
+                    nbr = knn_indices(canonical.get_xyz, k=8)   # neighbourhoods changed -> recompute
         mlp_opt.step(); mlp_opt.zero_grad(set_to_none=True)
         if args.multi_pose:
             canonical.optimizer.step(); canonical.optimizer.zero_grad(set_to_none=True)
