@@ -41,6 +41,7 @@ class CameraInfo(NamedTuple):
     depth_path: str = None      # path to depth/<stem>.npy    (metric float depth), RGB-D supervision
     px: float = 0.5             # normalized principal point cx/W (0.5 = centered)
     py: float = 0.5             # normalized principal point cy/H (0.5 = centered)
+    dynamic_mask_path: str = None  # path to dynamic_masks/<stem>.png (white = moving object, excluded from loss)
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -272,10 +273,17 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             if os.path.exists(dp):
                 depth_path = dp
 
+            # Optional dynamic-object mask: <path>/dynamic_masks/<stem>.png (white = moving object).
+            # Excluded from the static-reconstruction loss so movers don't corrupt the map.
+            dynamic_mask_path = None
+            dmp = os.path.join(path, "dynamic_masks", f"{image_name}.png")
+            if os.path.exists(dmp):
+                dynamic_mask_path = dmp
+
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
                             regions_path=regions_path, embeds_path=embeds_path, depth_path=depth_path,
-                            px=px, py=py))
+                            px=px, py=py, dynamic_mask_path=dynamic_mask_path))
 
     return cam_infos
 

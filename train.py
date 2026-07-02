@@ -87,8 +87,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         
         gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        # Optional dynamic-object mask: exclude moving-object pixels from the static-reconstruction
+        # loss (keep = 1 static, 0 dynamic) so movers don't corrupt/ghost the map.
+        keep = None
+        if getattr(viewpoint_cam, "dynamic_mask", None) is not None:
+            keep = (viewpoint_cam.dynamic_mask.cuda() < 0.5).float()   # (1,H,W): 1 = keep static
+        if keep is None:
+            Ll1 = l1_loss(image, gt_image)
+            ssim_term = ssim(image, gt_image)
+        else:
+            Ll1 = (torch.abs(image - gt_image) * keep).sum() / (keep.sum() * image.shape[0] + 1e-8)
+            ssim_term = ssim(image * keep, gt_image * keep)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_term)
         
         # regularization
         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
@@ -126,6 +136,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if opt.lambda_depth > 0 and getattr(viewpoint_cam, "gt_depth", None) is not None:
             gt_depth = viewpoint_cam.gt_depth.cuda()
             valid = gt_depth > 0
+            if keep is not None:
+                valid = valid & (keep > 0.5)   # also drop dynamic pixels from depth supervision
             depth_loss = (torch.abs(render_pkg["surf_depth"] - gt_depth)[valid].mean()
                           if valid.any() else torch.tensor(0.0, device="cuda"))
         else:

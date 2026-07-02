@@ -26,7 +26,7 @@ class Camera(nn.Module):
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  region_map=None, region_embeds=None, gt_depth=None,
-                 px=0.5, py=0.5,
+                 px=0.5, py=0.5, dynamic_mask=None,
                  ):
         super(Camera, self).__init__()
 
@@ -70,6 +70,10 @@ class Camera(nn.Module):
         # the pose scale; 0 = no measurement. Kept on CPU, moved to GPU at the loss
         # site (like region_map) to avoid pinning VRAM for unsampled views.
         self.gt_depth = gt_depth
+
+        # Optional dynamic-object mask (1, H, W) float in {0,1}; 1 = moving object, excluded
+        # from the static-reconstruction loss. CPU-held, .cuda() at the loss site.
+        self.dynamic_mask = dynamic_mask
 
         self.zfar = 100.0
         self.znear = 0.01

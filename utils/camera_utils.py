@@ -42,6 +42,20 @@ def _load_region_embeds(embeds_path):
     return torch.from_numpy(arr.astype(np.float32))
 
 
+def _load_dynamic_mask(mask_path, resolution):
+    """Load a per-frame dynamic-object mask (png, white = moving object) and resize (W,H) nearest.
+
+    Returns (1, H, W) float in {0, 1}; 1 = dynamic (excluded from the static-reconstruction loss).
+    """
+    if mask_path is None:
+        return None
+    img = Image.open(mask_path).convert("L")
+    if img.size != resolution:
+        img = img.resize(resolution, Image.NEAREST)
+    arr = (np.array(img) > 127).astype(np.float32)
+    return torch.from_numpy(arr)[None]   # (1, H, W)
+
+
 def _load_depth(depth_path, resolution):
     """Load a per-frame metric depth map (.npy, H x W float) and resize to (W, H).
 
@@ -91,13 +105,15 @@ def loadCam(args, id, cam_info, resolution_scale):
     region_map = _load_region_map(getattr(cam_info, "regions_path", None), resolution)
     region_embeds = _load_region_embeds(getattr(cam_info, "embeds_path", None))
     gt_depth = _load_depth(getattr(cam_info, "depth_path", None), resolution)
+    dynamic_mask = _load_dynamic_mask(getattr(cam_info, "dynamic_mask_path", None), resolution)
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
                   region_map=region_map, region_embeds=region_embeds, gt_depth=gt_depth,
-                  px=getattr(cam_info, "px", 0.5), py=getattr(cam_info, "py", 0.5))
+                  px=getattr(cam_info, "px", 0.5), py=getattr(cam_info, "py", 0.5),
+                  dynamic_mask=dynamic_mask)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
