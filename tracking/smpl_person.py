@@ -29,6 +29,7 @@ THREE project-specific unknowns are marked `# TODO(verify)` — check them on th
 --------------------------------------------------------------------------------------------------
 """
 import os
+import re
 import glob
 import json
 import pickle
@@ -46,6 +47,29 @@ def find_behave_frames(seq_root):
     converted set disagree.  # TODO(verify) mapping (2).
     """
     return sorted(glob.glob(f"{seq_root}/t*.000"))
+
+
+def resolve_frames(TS, smpl_root, override=None, n_select=24, stride=None):
+    """Map each converted timestep dir -> its raw BEHAVE frame dir.
+
+    The S1-3 converter (colab BEHAVE_deform_S1-3) selects
+    ``SEL = sorted(t*.000)[::stride][:n_select]`` (default n_select=24, stride=len(all)//n_select)
+    and writes each scene as ``timestep_{k:05d}`` where **k = index INTO SEL**. So a converted
+    ``timestep_00007`` maps to ``SEL[7]`` — NOT raw frame ``t0007.000`` and NOT the 7th loaded TS.
+    Pass ``--behave_frames`` to override, or ``--n_select``/``--select_stride`` if the convert used
+    other values. Returns a list parallel to ``TS`` (None where k is out of range).
+    """
+    if override:
+        return list(override)
+    allf = find_behave_frames(smpl_root)                  # sorted t*.000
+    st = stride or max(1, len(allf) // max(1, n_select))
+    sel = allf[::st][:n_select]
+    out = []
+    for i, ts in enumerate(TS):
+        m = re.search(r"timestep_(\d+)", os.path.basename(ts["dir"].rstrip("/")))
+        k = int(m.group(1)) if m else i
+        out.append(sel[k] if k < len(sel) else None)
+    return out
 
 
 def load_behave_smpl(frame_dir):
@@ -87,6 +111,26 @@ def load_mamma_smpl(frame_dir):
             "gender": str(get("gender", "neutral")), "model_type": "smplx"}
 
 
+def find_person_mesh(frame_dir):
+    """BEHAVE's per-frame fitted SMPL-H mesh (no model files needed to render it)."""
+    for cand in (f"{frame_dir}/person/fit02/person.ply",
+                 f"{frame_dir}/person/fit01/person.ply"):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
+def load_ply_verts(path):
+    """(N,3) vertices from a PLY (BEHAVE's fitted person mesh)."""
+    try:
+        from plyfile import PlyData
+        v = PlyData.read(path)["vertex"]
+        return np.stack([np.asarray(v["x"]), np.asarray(v["y"]), np.asarray(v["z"])], 1).astype(np.float64)
+    except Exception:
+        import trimesh
+        return np.asarray(trimesh.load(path, process=False).vertices, dtype=np.float64)
+
+
 _SMPL_CACHE = {}
 
 
@@ -122,6 +166,25 @@ def align_to_scene(pts, R=None, s=1.0, t=None):
     R = np.eye(3) if R is None else np.asarray(R)
     t = np.zeros(3) if t is None else np.asarray(t)
     return (s * (R @ pts.T)).T + t
+
+
+def get_person_verts(frame_dir, args):
+    """(verts (N,3), pelvis (3)) in the fit's world frame.
+
+    GT prefers BEHAVE's per-frame fitted mesh ``person/fit02/person.ply`` -> NO SMPL model files
+    needed. Falls back to posing params via smplx (needs ``--smpl_model_dir``); MAMMA always poses
+    via smplx. Pelvis = mesh centroid (mesh path) or SMPL joint-0 (smplx path) -> the Part-B root.
+    """
+    if args.smpl_source == "gt" and not args.force_smplx:
+        mp = find_person_mesh(frame_dir)
+        if mp is not None:
+            v = load_ply_verts(mp)
+            return v, v.mean(0)
+    loader = load_mamma_smpl if args.smpl_source == "mamma" else load_behave_smpl
+    params = loader(frame_dir)
+    mtype = params.get("model_type", "smplx" if args.smpl_source == "mamma" else "smplh")
+    assert args.smpl_model_dir, "posing via smplx needs --smpl_model_dir (or use BEHAVE's person.ply mesh)"
+    return pose_smpl(build_smpl_model(args.smpl_model_dir, params["gender"], mtype), params, mtype)
 
 
 # ----------------------------------------------------------------------------- body -> Gaussians
@@ -203,9 +266,12 @@ def render_sequence(args):
     rc.freeze(static)
 
     # --- SMPL source: one params dict per timestep ---
-    frames = args.behave_frames or find_behave_frames(args.smpl_root)
-    assert len(frames) >= N, f"{len(frames)} SMPL frame dirs < {N} timesteps (mapping (2))"
-    loader = load_mamma_smpl if args.smpl_source == "mamma" else load_behave_smpl
+    frames = resolve_frames(TS, args.smpl_root, args.behave_frames, args.n_select, args.select_stride)
+    assert len(frames) == N and all(f and os.path.isdir(f) for f in frames), \
+        f"frame mapping failed (unknown (2)); resolved: {frames}"
+    print("timestep -> raw frame mapping (verify (2)):")
+    for ti in range(min(N, 4)):
+        print(f"  {os.path.basename(TS[ti]['dir'])} -> {os.path.basename(frames[ti])}")
 
     try:
         import imageio.v2 as imageio
@@ -214,10 +280,7 @@ def render_sequence(args):
 
     per_psnr, root_traj, vframes = [], [], []
     for ti in range(N):
-        params = loader(frames[ti])
-        mtype = params.get("model_type", "smplh" if args.smpl_source == "gt" else "smplx")
-        model = build_smpl_model(args.smpl_model_dir, params["gender"], mtype)
-        verts, pelvis = pose_smpl(model, params, mtype)
+        verts, pelvis = get_person_verts(frames[ti], args)
         verts = align_to_scene(verts, t=args.align_t, s=args.align_s)
         pelvis = align_to_scene(pelvis[None], t=args.align_t, s=args.align_s)[0]
         root_traj.append(pelvis)
@@ -259,8 +322,7 @@ def render_sequence(args):
     fig, ax = plt.subplots(len(show), 2, figsize=(8, 3 * len(show))); ax = np.atleast_2d(ax)
     for r, ti in enumerate(show):
         cam = TS[ti]["cams"][args.view]
-        params = loader(frames[ti]); mtype = params.get("model_type", "smplh" if args.smpl_source == "gt" else "smplx")
-        verts, _ = pose_smpl(build_smpl_model(args.smpl_model_dir, params["gender"], mtype), params, mtype)
+        verts, _ = get_person_verts(frames[ti], args)
         verts = align_to_scene(verts, t=args.align_t, s=args.align_s)
         body = body_gaussians(verts, dataset.sh_degree, extent, opacity=args.body_opacity, scale_mul=args.body_scale)
         with torch.no_grad():
@@ -304,8 +366,16 @@ def main():
     p.add_argument("--smpl_source", choices=["gt", "mamma"], default="gt")
     p.add_argument("--smpl_root", help="raw BEHAVE sequence root (for gt) or MAMMA export root (mamma)")
     p.add_argument("--behave_frames", nargs="*", default=None,
-                   help="explicit per-timestep SMPL frame dirs (overrides --smpl_root glob); mapping (2)")
-    p.add_argument("--smpl_model_dir", required=True, help="dir with SMPL/SMPL-H/SMPL-X model files")
+                   help="explicit per-timestep SMPL frame dirs (overrides the SEL reconstruction)")
+    p.add_argument("--n_select", type=int, default=24,
+                   help="converter's N_TIMESTEPS (SEL = sorted(t*.000)[::stride][:n_select])")
+    p.add_argument("--select_stride", type=int, default=None,
+                   help="converter's frame stride (default len(all)//n_select), to reproduce SEL")
+    p.add_argument("--smpl_model_dir", default=None,
+                   help="dir with SMPL/SMPL-H/SMPL-X model files (only needed to POSE params; GT uses "
+                        "BEHAVE's person.ply mesh, so it's optional for --smpl_source gt)")
+    p.add_argument("--force_smplx", action="store_true",
+                   help="pose GT via smplx params even if a person.ply mesh exists (needs --smpl_model_dir)")
     p.add_argument("--view", type=int, default=0, help="which of the 4 cameras to render from")
     p.add_argument("--n_static", type=int, default=4)
     p.add_argument("--recon_iters", type=int, default=7000)
