@@ -112,12 +112,16 @@ def load_mamma_smpl(frame_dir):
 
 
 def find_person_mesh(frame_dir):
-    """BEHAVE's per-frame fitted SMPL-H mesh (no model files needed to render it)."""
-    for cand in (f"{frame_dir}/person/fit02/person.ply",
-                 f"{frame_dir}/person/fit01/person.ply"):
-        if os.path.exists(cand):
-            return cand
-    return None
+    """BEHAVE's per-frame person mesh under ``<frame>/person/`` (no SMPL model files needed).
+
+    Layout varies (fit02/ vs fit01/ vs a flat person.ply). Search recursively; prefer a fitted
+    SMPL mesh (path contains 'fit') over the raw fused scan.
+    """
+    hits = glob.glob(f"{frame_dir}/person/**/person.ply", recursive=True)
+    if not hits:
+        return None
+    fits = [h for h in hits if "fit" in os.path.dirname(h).lower()]
+    return (fits or hits)[0]
 
 
 def load_ply_verts(path):
