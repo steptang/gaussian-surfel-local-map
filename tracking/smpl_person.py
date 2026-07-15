@@ -49,25 +49,33 @@ def find_behave_frames(seq_root):
     return sorted(glob.glob(f"{seq_root}/t*.000"))
 
 
-def resolve_frames(TS, smpl_root, override=None, n_select=24, stride=None):
-    """Map each converted timestep dir -> its raw BEHAVE frame dir.
+def _timestep_index(ts):
+    m = re.search(r"timestep_(\d+)", os.path.basename(ts["dir"].rstrip("/")))
+    return int(m.group(1)) if m else None
 
-    The S1-3 converter (colab BEHAVE_deform_S1-3) selects
-    ``SEL = sorted(t*.000)[::stride][:n_select]`` (default n_select=24, stride=len(all)//n_select)
-    and writes each scene as ``timestep_{k:05d}`` where **k = index INTO SEL**. So a converted
-    ``timestep_00007`` maps to ``SEL[7]`` — NOT raw frame ``t0007.000`` and NOT the 7th loaded TS.
-    Pass ``--behave_frames`` to override, or ``--n_select``/``--select_stride`` if the convert used
-    other values. Returns a list parallel to ``TS`` (None where k is out of range).
+
+def resolve_frames(TS, smpl_root, override=None, n_select=24, stride=None, source="gt"):
+    """Map each converted timestep dir -> its SMPL frame dir (indexed by the timestep number k).
+
+    - **gt** (raw BEHAVE): the S1-3 converter selects ``SEL = sorted(t*.000)[::stride][:n_select]``
+      (default n_select=24, stride=len(all)//n_select) and names scenes ``timestep_{k:05d}`` where
+      **k = index INTO SEL**. So ``timestep_00007`` -> ``SEL[7]`` (NOT raw ``t0007.000``, NOT TS pos).
+    - **mamma**: exports written by ``behave_to_mamma output`` are ``frame_{k:05d}/`` with the SAME k,
+      so ``timestep_00007`` -> ``<smpl_root>/frame_00007``.
+    Pass ``--behave_frames`` to override, or ``--n_select``/``--select_stride`` (gt) if convert differed.
     """
     if override:
         return list(override)
+    if source == "mamma":
+        return [f"{smpl_root}/frame_{(_timestep_index(ts) if _timestep_index(ts) is not None else i):05d}"
+                for i, ts in enumerate(TS)]
     allf = find_behave_frames(smpl_root)                  # sorted t*.000
     st = stride or max(1, len(allf) // max(1, n_select))
     sel = allf[::st][:n_select]
     out = []
     for i, ts in enumerate(TS):
-        m = re.search(r"timestep_(\d+)", os.path.basename(ts["dir"].rstrip("/")))
-        k = int(m.group(1)) if m else i
+        k = _timestep_index(ts)
+        k = i if k is None else k
         out.append(sel[k] if k < len(sel) else None)
     return out
 
@@ -270,7 +278,8 @@ def render_sequence(args):
     rc.freeze(static)
 
     # --- SMPL source: one params dict per timestep ---
-    frames = resolve_frames(TS, args.smpl_root, args.behave_frames, args.n_select, args.select_stride)
+    frames = resolve_frames(TS, args.smpl_root, args.behave_frames, args.n_select,
+                            args.select_stride, args.smpl_source)
     assert len(frames) == N and all(f and os.path.isdir(f) for f in frames), \
         f"frame mapping failed (unknown (2)); resolved: {frames}"
     print("timestep -> raw frame mapping (verify (2)):")
