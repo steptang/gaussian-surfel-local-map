@@ -372,9 +372,18 @@ def train_avatar(args):
     pe_dim = 3 + 3 * 2 * args.pe_freqs
     mlp_skin = _mlp(pe_dim, n_joints).cuda() if args.skin_mlp else None
     mlp_pose = _mlp(63, 63).cuda() if args.pose_refine else None
+    # FREE per-frame pose deltas (GauHuman/SLAHMR-style pose optimization): pose error is angular ->
+    # misregistration grows with the lever arm (legs/feet), and an MLP(θ) can only learn a systematic
+    # bias. A directly-optimised Δθ per frame lets each frame's limbs snap onto the person.
+    pose_delta = (torch.zeros(len(order), 63, device="cuda").requires_grad_(True)
+                  if args.pose_delta else None)
+    ti_row = {ti: i for i, ti in enumerate(order)}
     extra_params = ([] if mlp_skin is None else list(mlp_skin.parameters())) + \
                    ([] if mlp_pose is None else list(mlp_pose.parameters()))
-    extra_opt = torch.optim.Adam(extra_params, lr=args.mlp_lr) if extra_params else None
+    extra_opt = torch.optim.Adam(
+        ([{"params": extra_params, "lr": args.mlp_lr}] if extra_params else []) +
+        ([{"params": [pose_delta], "lr": args.pose_delta_lr}] if pose_delta is not None else []),
+        eps=1e-15) if (extra_params or pose_delta is not None) else None
 
     def skin_weights():
         if mlp_skin is None:
@@ -383,9 +392,12 @@ def train_avatar(args):
 
     def pose_and_A(ti):
         fp = FP_t[ti]
-        if mlp_pose is not None:
-            dtheta = mlp_pose(fp[body_slice][None])[0]
-            fp = fp.clone(); fp[body_slice] = fp[body_slice] + dtheta
+        if mlp_pose is not None or pose_delta is not None:
+            fp = fp.clone()
+            if mlp_pose is not None:
+                fp[body_slice] = fp[body_slice] + mlp_pose(FP_t[ti][body_slice][None])[0]
+            if pose_delta is not None:
+                fp[body_slice] = fp[body_slice] + pose_delta[ti_row[ti]]
         return frame_transforms(model, J_rest, fp), TR_t[ti], fp
 
     CORR = {}                                          # ti -> (Rf, tf) rigid fix, filled below
@@ -504,6 +516,8 @@ def train_avatar(args):
         # regularisers: keep Δθ / skin-residual small
         if mlp_pose is not None:
             loss = loss + args.lambda_posereg * mlp_pose(FP_t[ti][body_slice][None]).pow(2).mean()
+        if pose_delta is not None:
+            loss = loss + args.lambda_posereg * pose_delta[ti_row[ti]].pow(2).mean()
         if mlp_skin is not None:
             loss = loss + args.lambda_skinreg * mlp_skin(
                 positional_encoding(g.get_xyz.detach(), args.pe_freqs)).pow(2).mean()
@@ -612,6 +626,11 @@ def main():
     p.add_argument("--no_skin_mlp", dest="skin_mlp", action="store_false")
     p.add_argument("--pose_refine", dest="pose_refine", action="store_true", default=True)
     p.add_argument("--no_pose_refine", dest="pose_refine", action="store_false")
+    p.add_argument("--pose_delta", dest="pose_delta", action="store_true", default=True,
+                   help="FREE per-frame body-pose deltas (23x63 params, directly optimised) — lets "
+                   "each frame's limbs snap onto the person; the fix for ghostly fast-moving legs")
+    p.add_argument("--no_pose_delta", dest="pose_delta", action="store_false")
+    p.add_argument("--pose_delta_lr", type=float, default=1e-3)
     p.add_argument("--mlp_lr", type=float, default=1e-4)
     # losses
     p.add_argument("--lambda_mask", type=float, default=0.1)
