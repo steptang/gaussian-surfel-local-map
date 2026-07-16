@@ -176,7 +176,11 @@ def mamma_to_exports(mamma_out_dir, exports_root):
 
     for i in range(T):
         fd = f"{exports_root}/frame_{i:05d}"; os.makedirs(fd, exist_ok=True)
+        # carry the FULL articulation: dropping hands renders flat mannequin hands in the wrong
+        # shape (person holds a box) -> chronic hand misregistration -> carved opacity -> holes.
         out = dict(global_orient=pose[i, :3], body_pose=pose[i, 3:66],
+                   jaw_pose=pose[i, 66:69], leye_pose=pose[i, 69:72], reye_pose=pose[i, 72:75],
+                   left_hand_pose=pose[i, 75:120], right_hand_pose=pose[i, 120:165],
                    betas=betas, transl=transl[i], gender="neutral", model_type="smplx")
         if verts is not None and i < len(verts):
             out["vertices"] = verts[i]                              # (10475,3), preferred by the renderer

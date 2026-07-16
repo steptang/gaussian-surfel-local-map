@@ -347,14 +347,22 @@ def train_avatar(args):
         g._opacity.data = g.inverse_opacity_activation(0.9 * torch.ones_like(g.get_opacity)).detach()  # solid, like the grey render (0.95)
     g.active_sh_degree = g.max_sh_degree
     g.training_setup(opt)                                                              # xyz/scale/rot/SH/opac/sem
-    # BIND to the body (the grey-person lesson): with trainable positions + a loose leash, the
-    # optimizer "explains" pose-misregistration by drifting/spreading surfels into a blurry halo.
-    # GHG fixes positions entirely (+1cm scale clamp) for sparse views — freeze xyz by default and
-    # let ONLY appearance/scale-in-cap/ΔR learn; --free_xyz restores drift.
-    if args.freeze_xyz:
+    # BINDING modes (the pendulum, one artifact each): 'free' xyz -> optimizer spreads surfels to
+    # absorb pose misregistration = blur; 'frozen' ON the naked SMPL surface -> hair/shoes/clothing
+    # (not in the body model) are unreachable = holes at head/hands/feet + pale ghost at the hairline.
+    # 'offset' = the published middle path (GaussianAvatars bounded triangle-offsets / GHG 4cm shells):
+    # positions learn at a reduced lr with an L2 ANCHOR back to the body surface — enough freedom to
+    # grow hair/shoes, not enough to blur.
+    anchor = None
+    if args.bind == "frozen":
         for group in g.optimizer.param_groups:
             if group["name"] == "xyz":
                 group["lr"] = 0.0
+    elif args.bind == "offset":
+        for group in g.optimizer.param_groups:
+            if group["name"] == "xyz":
+                group["lr"] *= args.xyz_lr_mul                 # slow, deliberate growth off the body
+        anchor = g.get_xyz.detach().clone()
     if args.person_embed and os.path.exists(args.person_embed):
         emb = torch.tensor(np.load(args.person_embed), dtype=torch.float, device="cuda").reshape(1, -1)
         with torch.no_grad():
@@ -482,8 +490,8 @@ def train_avatar(args):
           f"{args.iters} iters | skin_mlp={bool(mlp_skin)} pose_refine={bool(mlp_pose)} smooth={args.smooth}")
     import random
     for it in range(1, args.iters + 1):
-        if not args.freeze_xyz:
-            g.update_learning_rate(it)                 # (the scheduler would re-enable a frozen xyz lr)
+        if args.bind == "free":
+            g.update_learning_rate(it)                 # (the scheduler would override frozen/offset lr)
         ti = random.choice(order)
         cam = random.choice(TS[ti]["cams"])
         mask = PMASK[(ti, cam.image_name)]                                             # (1,H,W)
@@ -518,6 +526,8 @@ def train_avatar(args):
             loss = loss + args.lambda_posereg * mlp_pose(FP_t[ti][body_slice][None]).pow(2).mean()
         if pose_delta is not None:
             loss = loss + args.lambda_posereg * pose_delta[ti_row[ti]].pow(2).mean()
+        if anchor is not None:                         # offset binding: pull xyz back to the body
+            loss = loss + args.lambda_anchor * ((g.get_xyz - anchor) ** 2).sum(-1).mean()
         if mlp_skin is not None:
             loss = loss + args.lambda_skinreg * mlp_skin(
                 positional_encoding(g.get_xyz.detach(), args.pe_freqs)).pow(2).mean()
@@ -548,6 +558,8 @@ def train_avatar(args):
                     skin_base = torch.log(torch.tensor(
                         nearest_vertex_weights(g.get_xyz.detach().cpu().numpy(), v_shaped, lbs_w),
                         device="cuda") + 1e-8)
+                    if anchor is not None:             # re-anchor at the post-densify positions
+                        anchor = g.get_xyz.detach().clone()
                 if args.opacity_reset and it % opt.opacity_reset_interval == 0:
                     g.reset_opacity()                  # default OFF: a small in-frame person may never
                     #                                    recover opacity from a late reset
@@ -646,13 +658,17 @@ def main():
     p.add_argument("--scale_clamp", type=float, default=2.0, help="cap surfel scale at this x the "
                    "median init size (unbounded trainable scale balloons into blur; GHG hard-caps at "
                    "the anchor spacing); 0 = off")
-    p.add_argument("--body_prune", type=float, default=0.02, help="prune canonical surfels farther "
-                   "than this (m) from the rest body (GauHuman uses 0.05 with CLEAN poses; MAMMA "
-                   "noise needs a shorter leash); 0 = off")
-    p.add_argument("--freeze_xyz", dest="freeze_xyz", action="store_true", default=True,
-                   help="keep canonical surfel positions FIXED on the sampled body surface (grey-"
-                   "person crispness; GHG zero-positional-freedom); appearance/scale/ΔR still learn")
-    p.add_argument("--free_xyz", dest="freeze_xyz", action="store_false")
+    p.add_argument("--body_prune", type=float, default=0.05, help="prune canonical surfels farther "
+                   "than this (m) from the rest body (GauHuman's 0.05; hair/shoes need ~5cm — the "
+                   "anchor reg, not this leash, is now the anti-drift mechanism); 0 = off")
+    p.add_argument("--bind", choices=["frozen", "offset", "free"], default="offset",
+                   help="canonical-position binding: 'frozen'=fixed ON the naked body (crisp but "
+                   "hair/shoes/hands unreachable -> extremity holes); 'offset'=reduced-lr xyz + L2 "
+                   "anchor to the body (GaussianAvatars-style; grows hair/clothing without blur); "
+                   "'free'=unconstrained (blurs under pose misregistration)")
+    p.add_argument("--xyz_lr_mul", type=float, default=0.25, help="offset mode: xyz lr multiplier")
+    p.add_argument("--lambda_anchor", type=float, default=10.0, help="offset mode: L2 pull back to "
+                   "the body surface (10 => ~3cm offsets cost ~9e-3 loss — hair/shoe scale allowed)")
     p.add_argument("--opacity_reset", action="store_true",
                    help="enable periodic opacity resets (default off for a small in-frame person)")
     p.add_argument("--geom_warmup", type=int, default=1500, help="iters before normal/dist regs engage")
