@@ -16,3 +16,5 @@ build
 eval
 *.npz
 **/tmp
+# Local-only pointer to the research knowledge base (not part of the codebase)
+CLAUDE.md
