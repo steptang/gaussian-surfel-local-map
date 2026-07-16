@@ -186,19 +186,35 @@ def orthonormalize(R):
 
 
 def mat_to_quat(R):
-    """(P,3,3) rotation -> (P,4) wxyz quaternion (branchless, sign via off-diagonals)."""
+    """(P,3,3) rotation -> (P,4) wxyz quaternion, GRADIENT-SAFE (pytorch3d-style branch selection).
+
+    The naive ``sqrt(1+trace)/copysign`` form has an infinite d/dx sqrt at 0 — near-identity
+    rotations put 3 of 4 components exactly there, NaN-ing the whole backward pass. Here gradient
+    only flows through the argmax branch, whose sqrt argument is >= 1.
+    """
     import torch
-    m = R
-    q = torch.stack([1 + m[:, 0, 0] + m[:, 1, 1] + m[:, 2, 2],
-                     1 + m[:, 0, 0] - m[:, 1, 1] - m[:, 2, 2],
-                     1 - m[:, 0, 0] + m[:, 1, 1] - m[:, 2, 2],
-                     1 - m[:, 0, 0] - m[:, 1, 1] + m[:, 2, 2]], dim=-1)
-    q = torch.sqrt(torch.clamp(q, min=0.0)) / 2.0
-    w = q[:, 0]
-    x = torch.copysign(q[:, 1], m[:, 2, 1] - m[:, 1, 2])
-    y = torch.copysign(q[:, 2], m[:, 0, 2] - m[:, 2, 0])
-    z = torch.copysign(q[:, 3], m[:, 1, 0] - m[:, 0, 1])
-    out = torch.stack([w, x, y, z], dim=-1)
+    m = R.reshape(-1, 9)
+    m00, m01, m02, m10, m11, m12, m20, m21, m22 = m.unbind(-1)
+
+    def ssqrt(x):                                  # sqrt(max(x,0)) with zero (not inf) grad at <=0
+        ret = torch.zeros_like(x)
+        pos = x > 0
+        ret[pos] = torch.sqrt(x[pos])
+        return ret
+
+    q_abs = ssqrt(torch.stack([1.0 + m00 + m11 + m22,
+                               1.0 + m00 - m11 - m22,
+                               1.0 - m00 + m11 - m22,
+                               1.0 - m00 - m11 + m22], dim=-1))
+    quat_by_rijk = torch.stack([
+        torch.stack([q_abs[:, 0] ** 2, m21 - m12, m02 - m20, m10 - m01], dim=-1),
+        torch.stack([m21 - m12, q_abs[:, 1] ** 2, m10 + m01, m02 + m20], dim=-1),
+        torch.stack([m02 - m20, m10 + m01, q_abs[:, 2] ** 2, m12 + m21], dim=-1),
+        torch.stack([m10 - m01, m20 + m02, m21 + m12, q_abs[:, 3] ** 2], dim=-1),
+    ], dim=-2)                                     # (P,4,4): candidate wxyz per branch
+    quat_candidates = quat_by_rijk / (2.0 * q_abs[:, :, None].clamp(min=0.1))
+    idx = q_abs.argmax(dim=-1)
+    out = quat_candidates[torch.arange(len(idx), device=R.device), idx]
     return out / (out.norm(dim=-1, keepdim=True) + 1e-9)
 
 
@@ -380,6 +396,12 @@ def train_avatar(args):
         loss.backward()
 
         with torch.no_grad():
+            if not torch.isfinite(loss):               # insurance: never step on a poisoned batch
+                g.optimizer.zero_grad(set_to_none=True)
+                if extra_opt is not None:
+                    extra_opt.zero_grad(set_to_none=True)
+                print(f"  iter {it:5d} NON-FINITE loss -> batch skipped")
+                continue
             vis, radii = pkg["visibility_filter"], pkg["radii"]
             if it < args.densify_until:
                 g.max_radii2D[vis] = torch.max(g.max_radii2D[vis], radii[vis])
