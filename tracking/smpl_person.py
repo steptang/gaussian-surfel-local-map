@@ -280,11 +280,14 @@ def render_sequence(args):
     # --- SMPL source: one params dict per timestep ---
     frames = resolve_frames(TS, args.smpl_root, args.behave_frames, args.n_select,
                             args.select_stride, args.smpl_source)
-    assert len(frames) == N and all(f and os.path.isdir(f) for f in frames), \
-        f"frame mapping failed (unknown (2)); resolved: {frames}"
-    print("timestep -> raw frame mapping (verify (2)):")
-    for ti in range(min(N, 4)):
-        print(f"  {os.path.basename(TS[ti]['dir'])} -> {os.path.basename(frames[ti])}")
+    valid = [(ti, frames[ti]) for ti in range(N) if frames[ti] and os.path.isdir(frames[ti])]
+    assert valid, f"no SMPL frames resolved; first few: {frames[:3]}"
+    if len(valid) < N:
+        print(f"note: {N - len(valid)}/{N} timesteps have no SMPL frame -> skipped "
+              f"(e.g. MAMMA produced fewer frames than converted timesteps)")
+    print("timestep -> SMPL frame mapping (verify):")
+    for ti, fr in valid[:4]:
+        print(f"  {os.path.basename(TS[ti]['dir'])} -> {os.path.basename(fr)}")
 
     try:
         import imageio.v2 as imageio
@@ -292,8 +295,8 @@ def render_sequence(args):
         imageio = None
 
     per_psnr, root_traj, vframes = [], [], []
-    for ti in range(N):
-        verts, pelvis = get_person_verts(frames[ti], args)
+    for ti, frame in valid:
+        verts, pelvis = get_person_verts(frame, args)
         verts = align_to_scene(verts, t=args.align_t, s=args.align_s)
         pelvis = align_to_scene(pelvis[None], t=args.align_t, s=args.align_s)[0]
         root_traj.append(pelvis)
@@ -331,11 +334,11 @@ def render_sequence(args):
     print("METRICS:", json.dumps(metrics, indent=2))
 
     # quick GT|render grid on a few frames
-    show = list(range(0, N, max(1, N // 4)))[:4]
+    show = valid[::max(1, len(valid) // 4)][:4]
     fig, ax = plt.subplots(len(show), 2, figsize=(8, 3 * len(show))); ax = np.atleast_2d(ax)
-    for r, ti in enumerate(show):
+    for r, (ti, frame) in enumerate(show):
         cam = TS[ti]["cams"][args.view]
-        verts, _ = get_person_verts(frames[ti], args)
+        verts, _ = get_person_verts(frame, args)
         verts = align_to_scene(verts, t=args.align_t, s=args.align_s)
         body = body_gaussians(verts, dataset.sh_degree, extent, opacity=args.body_opacity, scale_mul=args.body_scale)
         with torch.no_grad():

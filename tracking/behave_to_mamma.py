@@ -141,49 +141,34 @@ def write_mamma_input(seq_dir, out_root, seq_name, kids, n_select, stride,
 
 
 # ----------------------------------------------------------------------------- OUTPUT converter
-def mamma_to_exports(mamma_out_dir, exports_root, quat=False):
-    """MAMMA ma_3d SMPL-X output -> per-frame ``<exports_root>/frame_{i:05d}/mamma.npz``.
+def mamma_to_exports(mamma_out_dir, exports_root):
+    """MAMMA ma_3d output -> per-frame ``<exports_root>/frame_{i:05d}/mamma.npz``.
 
-    ma_3d emits SMPL-X (global_orient, body_pose, betas, transl). The on-disk layout isn't documented,
-    so this DISCOVERS the per-frame param files (``.npz``/``.pkl``/``.json`` with those keys) and
-    normalises them. On the first run it PRINTS what it found — if nothing matches, paste me a
-    ``find`` of ``mamma_out_dir`` and I'll pin the parser. (verify)
+    MAMMA writes ONE multi-frame file per body: ``smplx_params_body_id-*.npz`` with
+    ``smplx_pose (T,165)`` = [global_orient(3), body_pose(63), jaw(3), eyes(6), hands(90)],
+    ``smplx_betas (1,16)`` (shared), ``smplx_translation (T,3)``. Split into per-frame SMPL-X params
+    (global_orient, body_pose, betas, transl) that ``smpl_person``'s ``load_mamma_smpl`` reads.
+    v1 = single person -> body 0.
     """
-    import pickle
     os.makedirs(exports_root, exist_ok=True)
-    cands = sorted(glob.glob(f"{mamma_out_dir}/**/*.npz", recursive=True) +
-                   glob.glob(f"{mamma_out_dir}/**/*.pkl", recursive=True) +
-                   glob.glob(f"{mamma_out_dir}/**/*.json", recursive=True))
-    print(f"found {len(cands)} candidate param files under {mamma_out_dir}; first few:")
-    for p in cands[:5]:
-        print("  ", p)
-
-    def load(p):
-        if p.endswith(".npz"):
-            return dict(np.load(p, allow_pickle=True))
-        if p.endswith(".pkl"):
-            return pickle.load(open(p, "rb"))
-        return json.load(open(p))
-
-    KEYS = ("global_orient", "body_pose", "betas", "transl")
-    n = 0
-    for p in cands:
-        try:
-            d = load(p)
-        except Exception:
-            continue
-        if not all(k in d for k in ("body_pose", "betas")):     # SMPL-X param file
-            continue
-        m = re.search(r"(\d{4,6})", os.path.basename(p))
-        i = int(m.group(1)) if m else n
-        out = {k: np.asarray(d[k]) for k in KEYS if k in d}
-        out["model_type"] = "smplx"
+    files = sorted(glob.glob(f"{mamma_out_dir}/**/smplx_params_body_id-*.npz", recursive=True))
+    if not files:
+        print(f"no smplx_params_body_id-*.npz under {mamma_out_dir} — check the ma_3d output path")
+        return 0
+    if len(files) > 1:
+        print(f"note: {len(files)} bodies; exporting body 0 only ({os.path.basename(files[0])})")
+    d = dict(np.load(files[0], allow_pickle=True))
+    pose = np.asarray(d["smplx_pose"], dtype=np.float32)            # (T,165)
+    transl = np.asarray(d["smplx_translation"], dtype=np.float32)   # (T,3)
+    betas = np.asarray(d["smplx_betas"], dtype=np.float32).reshape(-1)   # (16,), shared
+    T = pose.shape[0]
+    for i in range(T):
         fd = f"{exports_root}/frame_{i:05d}"; os.makedirs(fd, exist_ok=True)
-        np.savez(f"{fd}/mamma.npz", **out)
-        n += 1
-    print(f"wrote {n} per-frame exports -> {exports_root}/frame_*/mamma.npz"
-          + ("" if n else "  (0 — inspect mamma_out_dir layout and adjust; see docstring)"))
-    return n
+        np.savez(f"{fd}/mamma.npz",
+                 global_orient=pose[i, :3], body_pose=pose[i, 3:66],
+                 betas=betas, transl=transl[i], gender="neutral", model_type="smplx")
+    print(f"wrote {T} per-frame exports -> {exports_root}/frame_*/mamma.npz")
+    return T
 
 
 def main():
