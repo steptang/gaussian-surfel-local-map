@@ -250,12 +250,20 @@ def train_avatar(args):
     valid = [(ti, frames[ti]) for ti in range(N) if frames[ti] and os.path.isdir(frames[ti])]
     assert valid, "no SMPL frames resolved"
 
-    # --- static map (person masked out, fused over spread timesteps) ---
-    static_tis = sorted(set(np.linspace(0, N - 1, min(args.n_static, N)).astype(int).tolist()))
-    spts, scols, views_static = bd.fuse_region(TS, PMASK, static_tis, "static")
-    static = rc.reconstruct_masked(views_static, spts, scols, opt, pipe, bg, extent,
-                                   dataset.sh_degree, args.recon_iters, args.lambda_depth)
-    rc.freeze(static)
+    # --- static map (person masked out, fused over spread timesteps); PLY-cached across runs ---
+    if args.static_ply and os.path.exists(args.static_ply):
+        static = GaussianModel(dataset.sh_degree)
+        static.load_ply(args.static_ply)                # frozen by construction: no optimizer attached
+        print(f"static map loaded from cache {args.static_ply} ({static.get_xyz.shape[0]} surfels)")
+    else:
+        static_tis = sorted(set(np.linspace(0, N - 1, min(args.n_static, N)).astype(int).tolist()))
+        spts, scols, views_static = bd.fuse_region(TS, PMASK, static_tis, "static")
+        static = rc.reconstruct_masked(views_static, spts, scols, opt, pipe, bg, extent,
+                                       dataset.sh_degree, args.recon_iters, args.lambda_depth)
+        rc.freeze(static)
+        if args.static_ply:
+            static.save_ply(args.static_ply)
+            print("static map cached ->", args.static_ply)
 
     # --- SMPL model + one canonical shape (mean betas) ---
     assert args.smpl_model_dir, "canonical LBS needs --smpl_model_dir (SMPL/SMPL-H/SMPL-X model files)"
@@ -474,6 +482,8 @@ def main():
     p.add_argument("--densify_grad_threshold", type=float, default=2e-4)
     p.add_argument("--opacity_cull", type=float, default=0.05)
     # static map / misc
+    p.add_argument("--static_ply", default=None, help="static-map PLY cache: load if it exists, else "
+                   "reconstruct and save there (name it by recon config, e.g. static_boxtiny_7k.ply)")
     p.add_argument("--recon_iters", type=int, default=7000)
     p.add_argument("--n_static", type=int, default=4)
     p.add_argument("--view", type=int, default=0)
