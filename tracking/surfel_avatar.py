@@ -45,6 +45,7 @@ it, cf. the deform-rig Lever-B net-prune gotcha). MAMMA needs --smpl_model_dir n
 **params** via LBS (canonical), it no longer renders MAMMA's world-frame ``pred_vertices`` mesh directly.
 """
 import os
+import glob
 import json
 import argparse
 
@@ -71,7 +72,9 @@ def load_smpl_params(frame_dir, source):
         assert hits, f"no MAMMA .npz under {frame_dir}"
         d = np.load(hits[0], allow_pickle=True)
         get = lambda k: np.asarray(d[k]).reshape(-1) if k in d else None
-        out = {"betas": (get("betas") if get("betas") is not None else np.zeros(10))[:10],
+        # keep ALL betas (MAMMA exports 16) — truncating to 10 shifts the shape AND the pelvis,
+        # and global_orient rotates about the pelvis -> frame-dependent placement error.
+        out = {"betas": (get("betas") if get("betas") is not None else np.zeros(10)),
                "transl": (get("transl") if get("transl") is not None else np.zeros(3))[:3],
                "model_type": "smplx"}
         for k in ("global_orient", "body_pose", "jaw_pose", "leye_pose", "reye_pose",
@@ -111,8 +114,10 @@ def canonical_shape(model, betas):
     import torch
     from smplx.lbs import blend_shapes, vertices2joints
     b = torch.tensor(betas, dtype=torch.float32, device="cuda")[None]
-    shapedirs = model.shapedirs[..., :b.shape[1]]
-    v_shaped = model.v_template[None].cuda() + blend_shapes(b, shapedirs.cuda())      # (1,V,3)
+    nb = min(b.shape[1], model.shapedirs.shape[-1])          # never index past the model's beta space
+    if nb < b.shape[1]:
+        print(f"  canonical_shape: model has {nb} betas, params have {b.shape[1]} -> truncating")
+    v_shaped = model.v_template[None].cuda() + blend_shapes(b[:, :nb], model.shapedirs[..., :nb].cuda())  # (1,V,3)
     J = vertices2joints(model.J_regressor.cuda(), v_shaped)                            # (1,Jn,3)
     return v_shaped[0], J[0]                       # drop batch dims: (V,3), (Jn,3) as documented
 
@@ -288,8 +293,10 @@ def train_avatar(args):
         params[ti] = load_smpl_params(fr, args.smpl_source)
     mtype = params[valid[0][0]].get("model_type", "smplh")
     gender = str(params[valid[0][0]].get("gender", "neutral" if mtype == "smplx" else "male"))
-    model = sp.build_smpl_model(args.smpl_model_dir, gender, mtype)
     betas_bar = np.mean([params[ti]["betas"] for ti, _ in valid], axis=0)
+    import smplx                                     # create with the params' beta count (MAMMA = 16)
+    model = smplx.create(args.smpl_model_dir, model_type=mtype, gender=gender,
+                         use_pca=False, batch_size=1, num_betas=len(betas_bar))
     v_shaped, J_rest = canonical_shape(model, betas_bar)
     faces = np.asarray(model.faces, dtype=np.int64)
     lbs_w = model.lbs_weights.cuda()
@@ -302,11 +309,28 @@ def train_avatar(args):
     if args.smooth and args.smooth > 1 and len(order) >= args.smooth:
         k = args.smooth | 1                                                            # odd window
         pad = k // 2
+        ker = np.ones(k) / k
         def movavg(a):
             ap = np.pad(a, ((pad, pad), (0, 0)), mode="edge")
-            ker = np.ones(k) / k
             return np.stack([np.convolve(ap[:, c], ker, "valid") for c in range(a.shape[1])], 1)
-        FP, TR = movavg(FP), movavg(TR)
+        TR = movavg(TR)                                # translation is linear -> plain moving average
+        # rotations must NOT be averaged linearly in axis-angle (sign/2pi ambiguity: MAMMA jitter can
+        # flip representation between frames; averaging across a flip = garbage joints / a body swung
+        # around the pelvis -> the v3_6k_mamma_2 fog). Per joint: aa -> quat, hemisphere-align along
+        # time, moving-average, renormalise, back to aa.
+        from scipy.spatial.transform import Rotation
+        nF = FP.shape[0]
+        aa = FP.reshape(nF, -1, 3).copy()
+        for j in range(aa.shape[1]):
+            q = Rotation.from_rotvec(aa[:, j]).as_quat()                               # (F,4) xyzw
+            for i in range(1, nF):
+                if (q[i] * q[i - 1]).sum() < 0:
+                    q[i] = -q[i]
+            qp = np.pad(q, ((pad, pad), (0, 0)), mode="edge")
+            qs = np.stack([np.convolve(qp[:, c], ker, "valid") for c in range(4)], 1)
+            qs /= (np.linalg.norm(qs, axis=1, keepdims=True) + 1e-12)
+            aa[:, j] = Rotation.from_quat(qs).as_rotvec()
+        FP = aa.reshape(nF, -1).astype(np.float32)
     # np.convolve promotes to float64 -> pin float32 (the MLPs/rasterizer are Float)
     FP_t = {ti: torch.tensor(FP[i], dtype=torch.float32, device="cuda") for i, ti in enumerate(order)}
     TR_t = {ti: torch.tensor(TR[i], dtype=torch.float32, device="cuda") for i, ti in enumerate(order)}
@@ -330,6 +354,10 @@ def train_avatar(args):
 
     # skinning base (log NN weights) + learned residual MLP; pose-refine MLP (Δθ on the body joints)
     skin_base = torch.log(torch.tensor(skin0, device="cuda") + 1e-8)                   # (P,Jn)
+    # scale stays TRAINABLE (frozen scale under-tiles -> holes, cf. SGIA) but capped: v1 showed
+    # unbounded trainable scale balloons into blur when poses are imperfect.
+    scale_cap = (float(g._scaling.data.median().item()) + float(np.log(args.scale_clamp))
+                 if args.scale_clamp > 0 else None)
     pe_dim = 3 + 3 * 2 * args.pe_freqs
     mlp_skin = _mlp(pe_dim, n_joints).cuda() if args.skin_mlp else None
     mlp_pose = _mlp(63, 63).cuda() if args.pose_refine else None
@@ -349,6 +377,8 @@ def train_avatar(args):
             fp = fp.clone(); fp[body_slice] = fp[body_slice] + dtheta
         return frame_transforms(model, J_rest, fp), TR_t[ti], fp
 
+    CORR = {}                                          # ti -> (Rf, tf) rigid fix, filled below
+
     def posed(ti):
         """Return (posed_xyz (P,3), posed_quat (P,4)) for the current canonical surfels at frame ti."""
         A, transl, _ = pose_and_A(ti)
@@ -358,8 +388,65 @@ def train_avatar(args):
         xyz_h = torch.cat([xyz, torch.ones_like(xyz[:, :1])], -1)
         p = (T @ xyz_h[..., None])[:, :3, 0] + transl[None]
         Rb = orthonormalize(T[:, :3, :3])
+        if ti in CORR:                                 # rigid re-pose->pred_vertices correction
+            Rf, tf = CORR[ti]
+            p = p @ Rf.T + tf[None]
+            Rb = Rf[None] @ Rb
         Rc = build_rotation(g.get_rotation)                                            # canonical ΔR frame
         return p, mat_to_quat(Rb @ Rc)
+
+    # --- per-frame rigid correction: our re-posed body -> MAMMA's pred_vertices (Procrustes) ---
+    # Re-posing exported params through OUR smplx never exactly reproduces MAMMA's mesh (locked-head
+    # variant, missing pose correctives, the constant offset A.5 needed --align_t for). pred_vertices
+    # shares topology 1:1 with our model, so fit an exact rigid (R,t) per frame and report the
+    # residual — if the corrected error is still large, the pose itself (not placement) is off.
+    if args.rigid_correct and args.smpl_source == "mamma":
+        v_h = torch.cat([v_shaped, torch.ones_like(v_shaped[:, :1])], -1)
+        errs = []
+        for ti, fr in valid:
+            hits = glob.glob(f"{fr}/*.npz")
+            d = np.load(hits[0], allow_pickle=True) if hits else {}
+            if "vertices" not in d:
+                continue
+            pv = torch.tensor(np.asarray(d["vertices"], np.float32), device="cuda")
+            if pv.shape[0] != v_shaped.shape[0]:
+                print(f"rigid_correct OFF: vertex count mismatch ({pv.shape[0]} vs {v_shaped.shape[0]})")
+                break
+            with torch.no_grad():
+                A, transl, _ = pose_and_A(ti)
+                T = torch.einsum("vj,jmn->vmn", lbs_w, A)
+                vo = (T @ v_h[..., None])[:, :3, 0] + transl[None]
+                mu_o, mu_p = vo.mean(0), pv.mean(0)
+                U, S, Vh = torch.linalg.svd((vo - mu_o).T @ (pv - mu_p))
+                if torch.det(Vh.T @ U.T) < 0:
+                    Vh = torch.cat([Vh[:-1], -Vh[-1:]], 0)
+                Rf = Vh.T @ U.T
+                tf = mu_p - Rf @ mu_o
+                e0 = (vo - pv).norm(dim=-1).mean().item()
+                e1 = ((vo @ Rf.T + tf) - pv).norm(dim=-1).mean().item()
+            CORR[ti] = (Rf, tf)
+            errs.append((ti, e0, e1))
+        if errs:
+            worst = max(errs, key=lambda x: x[2])
+            print(f"rigid_correct: {len(errs)} frames | mean err re-pose->pred_vertices "
+                  f"{np.mean([e for _, e, _ in errs])*100:.1f}cm -> corrected "
+                  f"{np.mean([e for _, _, e in errs])*100:.1f}cm (worst ts {worst[0]}: {worst[2]*100:.1f}cm)")
+
+    # --- geometric sanity BEFORE appearance training: grey posed body composited at 3 frames ---
+    show0 = sorted({valid[0][0], valid[len(valid) // 2][0], valid[-1][0]})
+    fig, ax = plt.subplots(len(show0), 2, figsize=(8, 3 * len(show0))); ax = np.atleast_2d(ax)
+    for r, ti in enumerate(show0):
+        cam = TS[ti]["cams"][args.view]
+        with torch.no_grad():
+            xyz0, quat0 = posed(ti)
+            comp0 = render_composite(cam, [static, g], pipe, bg,
+                                     xyz_overrides=[None, xyz0], rot_overrides=[None, quat0])["render"]
+        ax[r, 0].imshow(sp._to_np(cam.original_image.cuda())); ax[r, 0].set_ylabel(f"ts {ti}")
+        ax[r, 1].imshow(sp._to_np(comp0))
+        for a_ in ax[r]: a_.set_xticks([]); a_.set_yticks([])
+    for c, t in enumerate(["GT", "init posed (grey)"]): ax[0, c].set_title(t)
+    plt.tight_layout(); plt.savefig(f"{args.out}/posed_init.png", dpi=120, bbox_inches="tight"); plt.close(fig)
+    print("wrote posed_init.png — check the grey body lands on the person BEFORE judging appearance")
 
     # --- optimise appearance+geometry in canonical space, articulated to ALL frames ---
     print(f"avatar: {g.get_xyz.shape[0]} canonical surfels, {len(valid)} frames, {n_joints} joints, "
@@ -413,9 +500,12 @@ def train_avatar(args):
                     skin_base = torch.log(torch.tensor(
                         nearest_vertex_weights(g.get_xyz.detach().cpu().numpy(), v_shaped, lbs_w),
                         device="cuda") + 1e-8)
-                if it % opt.opacity_reset_interval == 0:
-                    g.reset_opacity()
+                if args.opacity_reset and it % opt.opacity_reset_interval == 0:
+                    g.reset_opacity()                  # default OFF: a small in-frame person may never
+                    #                                    recover opacity from a late reset
             g.optimizer.step(); g.optimizer.zero_grad(set_to_none=True)
+            if scale_cap is not None:
+                g._scaling.data.clamp_(max=scale_cap)
             if extra_opt is not None:
                 extra_opt.step(); extra_opt.zero_grad(set_to_none=True)
         if it % 500 == 0:
@@ -496,6 +586,14 @@ def main():
     p.add_argument("--lambda_dist", type=float, default=100.0)
     p.add_argument("--lambda_posereg", type=float, default=1e-2)
     p.add_argument("--lambda_skinreg", type=float, default=1e-3)
+    # placement / stability
+    p.add_argument("--rigid_correct", dest="rigid_correct", action="store_true", default=True,
+                   help="per-frame Procrustes fix of the re-posed body onto MAMMA's pred_vertices")
+    p.add_argument("--no_rigid_correct", dest="rigid_correct", action="store_false")
+    p.add_argument("--scale_clamp", type=float, default=4.0, help="cap surfel scale at this x the "
+                   "median init size (unbounded trainable scale balloons into blur); 0 = off")
+    p.add_argument("--opacity_reset", action="store_true",
+                   help="enable periodic opacity resets (default off for a small in-frame person)")
     p.add_argument("--geom_warmup", type=int, default=1500, help="iters before normal/dist regs engage")
     # densification (exposed — cf. deform-rig Lever-B net-prune gotcha)
     p.add_argument("--densify_from", type=int, default=500)
