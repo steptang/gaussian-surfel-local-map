@@ -123,25 +123,34 @@ def train_avatar(args):
                                       colors=np.full_like(VERT[ref], 0.6, dtype=np.float64),
                                       normals=np.zeros_like(VERT[ref])), spatial_lr_scale=extent)
     g.active_sh_degree = g.max_sh_degree
+    with torch.no_grad():
+        # FREEZE scale at a fixed body-tiling size (trainable scale balloons -> fuzzy blur); enlarge to
+        # close the gaps between the ~10k dense verts, and start opacity solid.
+        g._scaling.data = g._scaling.data + float(np.log(max(args.scale_mul, 1e-3)))
+        g._opacity.data = g.inverse_opacity_activation(0.7 * torch.ones_like(g.get_opacity)).detach()
     if args.person_embed and os.path.exists(args.person_embed):    # constant "person" semantic (queryable)
         emb = torch.tensor(np.load(args.person_embed), dtype=torch.float, device="cuda").reshape(1, -1)
         with torch.no_grad():
             g._semantic.data = emb.repeat(g._semantic.shape[0], 1)
-    # optimise APPEARANCE only (positions/rotations come from the mesh each frame)
+    # optimise COLOUR + opacity only (positions/rotations from the mesh each frame; scale frozen -> crisp)
     optimizer = torch.optim.Adam([
         {"params": [g._features_dc], "lr": 0.01, "name": "f_dc"},
         {"params": [g._features_rest], "lr": 0.01 / 20.0, "name": "f_rest"},
-        {"params": [g._opacity], "lr": 0.05, "name": "opacity"},
-        {"params": [g._scaling], "lr": 0.005, "name": "scaling"},
+        {"params": [g._opacity], "lr": 0.02, "name": "opacity"},
     ], eps=1e-15)
 
     def frame_tensors(ti):
         return (torch.tensor(VERT[ti], device="cuda"),
                 torch.tensor(QUAT[ti], device="cuda"))
 
-    print(f"training avatar: {g.get_xyz.shape[0]} surfels x {len(valid)} frames, {args.iters} iters")
+    # train appearance on a FEW well-spread frames (MAMMA jitter -> averaging over all frames blurs it);
+    # fewer = sharper but less body coverage, more = more coverage but softer.
+    tex_ids = [valid[i][0] for i in np.linspace(0, len(valid) - 1,
+               min(args.tex_frames, len(valid))).astype(int)]
+    print(f"training avatar: {g.get_xyz.shape[0]} surfels, appearance from timesteps {tex_ids}, "
+          f"{args.iters} iters (scale frozen x{args.scale_mul})")
     for it in range(1, args.iters + 1):
-        ti = random.choice(valid)[0]
+        ti = random.choice(tex_ids)
         cam = random.choice(TS[ti]["cams"])
         keep = PMASK[(ti, cam.image_name)]
         xyz, rot = frame_tensors(ti)
@@ -211,6 +220,9 @@ def main():
     p.add_argument("--n_select", type=int, default=24)
     p.add_argument("--select_stride", type=int, default=None)
     p.add_argument("--iters", type=int, default=4000)
+    p.add_argument("--tex_frames", type=int, default=3, help="# well-spread frames used to fit appearance "
+                   "(fewer = sharper but less coverage; MAMMA jitter makes 'all frames' blur)")
+    p.add_argument("--scale_mul", type=float, default=2.0, help="frozen surfel-size multiplier (tile the body)")
     p.add_argument("--recon_iters", type=int, default=7000, help="static-map recon iters")
     p.add_argument("--n_static", type=int, default=4)
     p.add_argument("--lambda_depth", type=float, default=1.0)
