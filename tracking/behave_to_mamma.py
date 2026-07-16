@@ -110,9 +110,10 @@ def write_mamma_input(seq_dir, out_root, seq_name, kids, n_select, stride,
             resolution=[W, H], translation=t.tolist(),
             rotation_quaternion=_R_to_quat(R, quat_order))
 
-    # images: k{kid}.color.jpg -> images/cam_{kid+1:02d}/{i:05d}.jpg
+    # images: k{kid}.color.jpg -> <seq>/cam_{kid+1:02d}/{i:05d}.jpg
+    # MAMMA discovery globs <seq>/* for cam dirs that DIRECTLY hold images (no images/ level).
     for kid in kids:
-        cdir = f"{seq_out}/images/cam_{kid + 1:02d}"; os.makedirs(cdir, exist_ok=True)
+        cdir = f"{seq_out}/cam_{kid + 1:02d}"; os.makedirs(cdir, exist_ok=True)
         for i, ft in enumerate(SEL):
             im = cv2.imread(f"{ft}/k{kid}.color.jpg")
             assert im is not None, f"missing {ft}/k{kid}.color.jpg"
