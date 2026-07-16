@@ -106,7 +106,7 @@ def write_mamma_input(seq_dir, out_root, seq_name, kids, n_select, stride,
             R, t = R_c2w, t_c2w
         cameras[f"cam_{kid + 1:02d}"] = dict(
             camera_model="pinhole", distortion_model="radtan",
-            intrinsics=[fx, fy, cx, cy], distortion_coeffs=[0.0, 0.0, 0.0, 0.0, 0.0],
+            intrinsics=[fx, fy, cx, cy], distortion_coeffs=[0.0, 0.0, 0.0, 0.0],  # radtan wants 4 [k1,k2,p1,p2]
             resolution=[W, H], translation=t.tolist(),
             rotation_quaternion=_R_to_quat(R, quat_order))
 
