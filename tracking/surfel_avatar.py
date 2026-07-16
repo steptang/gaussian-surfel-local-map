@@ -344,9 +344,17 @@ def train_avatar(args):
                                       normals=nrm.astype(np.float64)), spatial_lr_scale=extent)
     with torch.no_grad():
         g._rotation.data = torch.tensor(normals_to_quats(nrm), device="cuda")          # residual-rot prior
-        g._opacity.data = g.inverse_opacity_activation(0.7 * torch.ones_like(g.get_opacity)).detach()
+        g._opacity.data = g.inverse_opacity_activation(0.9 * torch.ones_like(g.get_opacity)).detach()  # solid, like the grey render (0.95)
     g.active_sh_degree = g.max_sh_degree
     g.training_setup(opt)                                                              # xyz/scale/rot/SH/opac/sem
+    # BIND to the body (the grey-person lesson): with trainable positions + a loose leash, the
+    # optimizer "explains" pose-misregistration by drifting/spreading surfels into a blurry halo.
+    # GHG fixes positions entirely (+1cm scale clamp) for sparse views — freeze xyz by default and
+    # let ONLY appearance/scale-in-cap/ΔR learn; --free_xyz restores drift.
+    if args.freeze_xyz:
+        for group in g.optimizer.param_groups:
+            if group["name"] == "xyz":
+                group["lr"] = 0.0
     if args.person_embed and os.path.exists(args.person_embed):
         emb = torch.tensor(np.load(args.person_embed), dtype=torch.float, device="cuda").reshape(1, -1)
         with torch.no_grad():
@@ -462,7 +470,8 @@ def train_avatar(args):
           f"{args.iters} iters | skin_mlp={bool(mlp_skin)} pose_refine={bool(mlp_pose)} smooth={args.smooth}")
     import random
     for it in range(1, args.iters + 1):
-        g.update_learning_rate(it)
+        if not args.freeze_xyz:
+            g.update_learning_rate(it)                 # (the scheduler would re-enable a frozen xyz lr)
         ti = random.choice(order)
         cam = random.choice(TS[ti]["cams"])
         mask = PMASK[(ti, cam.image_name)]                                             # (1,H,W)
@@ -615,10 +624,16 @@ def main():
     p.add_argument("--rigid_correct", dest="rigid_correct", action="store_true", default=True,
                    help="per-frame Procrustes fix of the re-posed body onto MAMMA's pred_vertices")
     p.add_argument("--no_rigid_correct", dest="rigid_correct", action="store_false")
-    p.add_argument("--scale_clamp", type=float, default=4.0, help="cap surfel scale at this x the "
-                   "median init size (unbounded trainable scale balloons into blur); 0 = off")
-    p.add_argument("--body_prune", type=float, default=0.05, help="prune canonical surfels farther "
-                   "than this (m) from the rest body (GauHuman knn threshold=0.05); 0 = off")
+    p.add_argument("--scale_clamp", type=float, default=2.0, help="cap surfel scale at this x the "
+                   "median init size (unbounded trainable scale balloons into blur; GHG hard-caps at "
+                   "the anchor spacing); 0 = off")
+    p.add_argument("--body_prune", type=float, default=0.02, help="prune canonical surfels farther "
+                   "than this (m) from the rest body (GauHuman uses 0.05 with CLEAN poses; MAMMA "
+                   "noise needs a shorter leash); 0 = off")
+    p.add_argument("--freeze_xyz", dest="freeze_xyz", action="store_true", default=True,
+                   help="keep canonical surfel positions FIXED on the sampled body surface (grey-"
+                   "person crispness; GHG zero-positional-freedom); appearance/scale/ΔR still learn")
+    p.add_argument("--free_xyz", dest="freeze_xyz", action="store_false")
     p.add_argument("--opacity_reset", action="store_true",
                    help="enable periodic opacity resets (default off for a small in-frame person)")
     p.add_argument("--geom_warmup", type=int, default=1500, help="iters before normal/dist regs engage")
