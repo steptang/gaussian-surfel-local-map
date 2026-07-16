@@ -75,7 +75,7 @@ def _R_to_quat(R, order="wxyz"):
 
 # ----------------------------------------------------------------------------- INPUT adapter
 def write_mamma_input(seq_dir, out_root, seq_name, kids, n_select, stride,
-                      extrinsics="world2cam", quat_order="wxyz"):
+                      extrinsics="world2cam", quat_order="wxyz", fps=30):
     import cv2
     import yaml
     from data.kinect_transform import KinectTransform   # xiexh20/behave-dataset on sys.path
@@ -110,24 +110,28 @@ def write_mamma_input(seq_dir, out_root, seq_name, kids, n_select, stride,
             resolution=[W, H], translation=t.tolist(),
             rotation_quaternion=_R_to_quat(R, quat_order))
 
-    # images: k{kid}.color.jpg -> <seq>/cam_{kid+1:02d}/{i:05d}.jpg
-    # MAMMA discovery globs <seq>/* for cam dirs that DIRECTLY hold images (no images/ level).
+    # videos: MAMMA's runner is video-first -> <seq>/videos_crf24/<cam>.mp4 (one mp4 per Kinect).
+    # (ma_cap also supports --images_root_dir, but the --footage runner defaults to videos_crf24.)
+    vdir = f"{seq_out}/videos_crf24"; os.makedirs(vdir, exist_ok=True)
     for kid in kids:
-        cdir = f"{seq_out}/cam_{kid + 1:02d}"; os.makedirs(cdir, exist_ok=True)
-        for i, ft in enumerate(SEL):
-            im = cv2.imread(f"{ft}/k{kid}.color.jpg")
-            assert im is not None, f"missing {ft}/k{kid}.color.jpg"
-            cv2.imwrite(f"{cdir}/{i:05d}.jpg", im)
+        frames = [cv2.imread(f"{ft}/k{kid}.color.jpg") for ft in SEL]
+        assert all(f is not None for f in frames), f"missing color for k{kid}"
+        H, W = frames[0].shape[:2]
+        vw = cv2.VideoWriter(f"{vdir}/cam_{kid + 1:02d}.mp4",
+                             cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+        for f in frames:
+            vw.write(f)
+        vw.release()
 
     calib_path = f"{out_root}/{seq_name}.calib.yaml"
     yaml.safe_dump({"cameras": cameras}, open(calib_path, "w"), sort_keys=False)
-    capture = {"capture_root": out_root, "calib": calib_path, "cam_fps": 30,
-               "images_subdir": "images", "cams": [f"cam_{k + 1:02d}" for k in kids],
+    capture = {"capture_root": out_root, "calib": calib_path, "cam_fps": fps,
+               "videos_subdir": "videos_crf24", "cams": [f"cam_{k + 1:02d}" for k in kids],
                "sequences": {"000": {"name": seq_name}}}
     cap_path = f"{out_root}/{seq_name}.capture.json"
     json.dump(capture, open(cap_path, "w"), indent=2)
 
-    print(f"wrote {len(SEL)} frames x {len(kids)} cams -> {seq_out}/images")
+    print(f"wrote {len(SEL)} frames x {len(kids)} cams -> {vdir}/cam_*.mp4  (frames 0..{len(SEL) - 1})")
     print(f"calib   -> {calib_path}   (extrinsics={extrinsics}, quat={quat_order}; VERIFY E/Q)")
     print(f"capture -> {cap_path}")
     print("\nRun MAMMA (in its env), e.g.:")
@@ -195,6 +199,7 @@ def main():
     pi.add_argument("--stride", type=int, default=None)
     pi.add_argument("--extrinsics", choices=["world2cam", "cam2world"], default="world2cam")
     pi.add_argument("--quat_order", choices=["wxyz", "xyzw"], default="wxyz")
+    pi.add_argument("--fps", type=int, default=30, help="fps for the written per-camera mp4s")
 
     po = sub.add_parser("output", help="MAMMA ma_3d SMPL-X -> per-frame .npz exports")
     po.add_argument("--mamma_out_dir", required=True, help="MAMMA output/ma_3d/<tag>/<seq> dir")
@@ -203,7 +208,7 @@ def main():
     a = p.parse_args()
     if a.cmd == "input":
         write_mamma_input(a.seq_dir, a.out_root, a.seq_name, a.kids, a.n_select, a.stride,
-                          a.extrinsics, a.quat_order)
+                          a.extrinsics, a.quat_order, a.fps)
     else:
         mamma_to_exports(a.mamma_out_dir, a.exports_root)
 
