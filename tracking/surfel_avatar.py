@@ -132,11 +132,13 @@ def frame_transforms(model, J_rest, full_pose):
 
 
 # ============================================================================= canonical surfel sampling
-def sample_body_surface(v_shaped, faces, lbs_weights, n):
+def sample_body_surface(v_shaped, faces, lbs_weights, n, detail_boost=0.3):
     """Densely sample the rest body surface -> (P(n,3), skin_weights(n,Jn), normals(n,3)) numpy.
 
-    Barycentric sampling weighted by triangle area; skinning + normals are barycentric-interpolated from
-    the face's 3 vertices. Denser than one-surfel-per-vertex -> closes the tiling holes at init.
+    Barycentric sampling; probability = (1-detail_boost)*area-weighted + detail_boost*uniform-per-
+    TRIANGLE. Pure area weighting starves the face/hands (small area but finely tessellated — SMPL-X
+    puts a huge share of its triangles there ON PURPOSE); the uniform-per-triangle term re-concentrates
+    samples where the template wants detail, recovering v1/v2's per-vertex face density.
     """
     v = v_shaped.detach().cpu().numpy()
     W = lbs_weights.detach().cpu().numpy()
@@ -144,7 +146,8 @@ def sample_body_surface(v_shaped, faces, lbs_weights, n):
     e1, e2 = tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]
     fn = np.cross(e1, e2)
     area = 0.5 * np.linalg.norm(fn, axis=1) + 1e-12
-    fidx = np.random.choice(len(faces), size=n, p=area / area.sum())
+    p = (1.0 - detail_boost) * (area / area.sum()) + detail_boost / len(faces)
+    fidx = np.random.choice(len(faces), size=n, p=p / p.sum())
     r1, r2 = np.random.rand(n, 1), np.random.rand(n, 1)
     s = np.sqrt(r1)
     b0, b1, b2 = (1 - s), s * (1 - r2), s * r2                                         # barycentric
@@ -337,7 +340,7 @@ def train_avatar(args):
     body_slice = slice(3, 3 + 63)                                                      # 21 body joints
 
     # --- canonical surfels: dense surface samples, ΔR init from surface normal, scale TRAINABLE ---
-    Pc, skin0, nrm = sample_body_surface(v_shaped, faces, lbs_w, args.n_canon)
+    Pc, skin0, nrm = sample_body_surface(v_shaped, faces, lbs_w, args.n_canon, args.detail_boost)
     g = GaussianModel(dataset.sh_degree)
     g.create_from_pcd(BasicPointCloud(points=Pc.astype(np.float64),
                                       colors=np.full_like(Pc, 0.6, dtype=np.float64),
@@ -631,6 +634,9 @@ def main():
     p.add_argument("--select_stride", type=int, default=None)
     # canonical / recipe
     p.add_argument("--n_canon", type=int, default=60000, help="# canonical surface-sampled surfels")
+    p.add_argument("--detail_boost", type=float, default=0.3, help="fraction of canonical samples "
+                   "drawn uniform-per-TRIANGLE instead of by area — concentrates surfels on the "
+                   "finely-tessellated face/hands (pure area sampling starves them); 0 = area only")
     p.add_argument("--iters", type=int, default=6000)
     p.add_argument("--pe_freqs", type=int, default=4, help="positional-encoding freqs for the skin MLP")
     p.add_argument("--smooth", type=int, default=5, help="temporal pose-smoothing window (odd; 0/1=off)")
