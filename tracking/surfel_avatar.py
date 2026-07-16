@@ -355,9 +355,12 @@ def train_avatar(args):
     # skinning base (log NN weights) + learned residual MLP; pose-refine MLP (Δθ on the body joints)
     skin_base = torch.log(torch.tensor(skin0, device="cuda") + 1e-8)                   # (P,Jn)
     # scale stays TRAINABLE (frozen scale under-tiles -> holes, cf. SGIA) but capped: v1 showed
-    # unbounded trainable scale balloons into blur when poses are imperfect.
+    # unbounded trainable scale balloons into blur when poses are imperfect. (Validated: GHG's
+    # sparse-view stability = a HARD clamp_max on scale tied to anchor spacing.)
     scale_cap = (float(g._scaling.data.median().item()) + float(np.log(args.scale_clamp))
                  if args.scale_clamp > 0 else None)
+    from scipy.spatial import cKDTree
+    body_tree = cKDTree(v_shaped.detach().cpu().numpy())     # rest-body surface, for the off-body prune
     pe_dim = 3 + 3 * 2 * args.pe_freqs
     mlp_skin = _mlp(pe_dim, n_joints).cuda() if args.skin_mlp else None
     mlp_pose = _mlp(63, 63).cuda() if args.pose_refine else None
@@ -461,9 +464,18 @@ def train_avatar(args):
         pkg = render(cam, g, pipe, bg, means3D_override=xyz, rotations_override=quat)
         img, alpha, dep = pkg["render"], pkg["rend_alpha"], pkg["surf_depth"]
         gt = cam.original_image.cuda()
-        # photometric (person region) + silhouette (α vs mask, closes/kills holes+halo)
+        # photometric (person region) + silhouette (α vs mask, closes/kills holes+halo).
+        # SSIM on the mask's BBOX CROP (GauHuman: cv2.boundingRect) — full-image SSIM statistics
+        # drown a person occupying ~1-2% of the pixels.
         Ll1 = (torch.abs(img - gt) * mask).sum() / (mask.sum() * 3 + 1e-8)
-        loss = (1 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1 - ssim(img * mask, gt * mask))
+        ys, xs = torch.where(mask[0] > 0.5)
+        if len(ys) > 0:
+            y0, y1 = int(ys.min()), int(ys.max()) + 1
+            x0, x1 = int(xs.min()), int(xs.max()) + 1
+            ssim_term = 1 - ssim(img[:, y0:y1, x0:x1], gt[:, y0:y1, x0:x1])
+        else:
+            ssim_term = torch.zeros((), device="cuda")
+        loss = (1 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_term
         loss = loss + args.lambda_mask * torch.abs(alpha - mask).mean()
         # depth (RGB-D — our edge; both LBS papers omit it)
         if args.lambda_depth > 0 and getattr(cam, "gt_depth", None) is not None:
@@ -496,6 +508,13 @@ def train_avatar(args):
                 if it > args.densify_from and it % args.densify_interval == 0:
                     size_thresh = 20 if it > opt.opacity_reset_interval else None
                     g.densify_and_prune(args.densify_grad_threshold, args.opacity_cull, extent, size_thresh)
+                    # GauHuman-style body-prior prune: canonical surfels drifting off the rest body die
+                    # (their knn-to-SMPL threshold=0.05 — the geometric anti-floater/fog constraint)
+                    if args.body_prune > 0:
+                        dist, _ = body_tree.query(g.get_xyz.detach().cpu().numpy(), k=1)
+                        far = torch.tensor(dist > args.body_prune, device="cuda")
+                        if far.any():
+                            g.prune_points(far)
                     # canonical topology changed -> resync skinning base + PE inputs to new surfels
                     skin_base = torch.log(torch.tensor(
                         nearest_vertex_weights(g.get_xyz.detach().cpu().numpy(), v_shaped, lbs_w),
@@ -592,6 +611,8 @@ def main():
     p.add_argument("--no_rigid_correct", dest="rigid_correct", action="store_false")
     p.add_argument("--scale_clamp", type=float, default=4.0, help="cap surfel scale at this x the "
                    "median init size (unbounded trainable scale balloons into blur); 0 = off")
+    p.add_argument("--body_prune", type=float, default=0.05, help="prune canonical surfels farther "
+                   "than this (m) from the rest body (GauHuman knn threshold=0.05); 0 = off")
     p.add_argument("--opacity_reset", action="store_true",
                    help="enable periodic opacity resets (default off for a small in-frame person)")
     p.add_argument("--geom_warmup", type=int, default=1500, help="iters before normal/dist regs engage")
