@@ -283,8 +283,9 @@ def train_avatar(args):
             ker = np.ones(k) / k
             return np.stack([np.convolve(ap[:, c], ker, "valid") for c in range(a.shape[1])], 1)
         FP, TR = movavg(FP), movavg(TR)
-    FP_t = {ti: torch.tensor(FP[i], device="cuda") for i, ti in enumerate(order)}
-    TR_t = {ti: torch.tensor(TR[i], device="cuda") for i, ti in enumerate(order)}
+    # np.convolve promotes to float64 -> pin float32 (the MLPs/rasterizer are Float)
+    FP_t = {ti: torch.tensor(FP[i], dtype=torch.float32, device="cuda") for i, ti in enumerate(order)}
+    TR_t = {ti: torch.tensor(TR[i], dtype=torch.float32, device="cuda") for i, ti in enumerate(order)}
     body_slice = slice(3, 3 + 63)                                                      # 21 body joints
 
     # --- canonical surfels: dense surface samples, ΔR init from surface normal, scale TRAINABLE ---
