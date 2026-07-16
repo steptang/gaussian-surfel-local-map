@@ -268,7 +268,7 @@ def render_sequence(args):
     import matplotlib.pyplot as plt
     import tracking.behave_data as bd
     import tracking.reconstruct as rc
-    from gaussian_renderer import render  # noqa: F401 (kept for parity / debugging)
+    from gaussian_renderer import render, GaussianModel  # noqa: F401 (render kept for parity)
     from tracking.render_compose import render_composite
 
     os.makedirs(f"{args.out}/frames", exist_ok=True)
@@ -280,13 +280,21 @@ def render_sequence(args):
     N = len(TS)
     assert N >= 2, f"need >=2 timesteps, got {N}"
 
-    # --- static map fused from spread timesteps (fills person-occlusion holes) [as train_deform] ---
-    static_tis = sorted(set(np.linspace(0, N - 1, min(args.n_static, N)).astype(int).tolist()))
-    spts, scols, views_static = bd.fuse_region(TS, PMASK, static_tis, "static")
-    print("reconstructing static map from timesteps", static_tis)
-    static = rc.reconstruct_masked(views_static, spts, scols, opt, pipe, bg, extent,
-                                   dataset.sh_degree, args.recon_iters, args.lambda_depth)
-    rc.freeze(static)
+    # --- static map fused from spread timesteps; PLY-cached across runs (as surfel_avatar) ---
+    if args.static_ply and os.path.exists(args.static_ply):
+        static = GaussianModel(dataset.sh_degree)
+        static.load_ply(args.static_ply)               # frozen by construction: no optimizer attached
+        print(f"static map loaded from cache {args.static_ply} ({static.get_xyz.shape[0]} surfels)")
+    else:
+        static_tis = sorted(set(np.linspace(0, N - 1, min(args.n_static, N)).astype(int).tolist()))
+        spts, scols, views_static = bd.fuse_region(TS, PMASK, static_tis, "static")
+        print("reconstructing static map from timesteps", static_tis)
+        static = rc.reconstruct_masked(views_static, spts, scols, opt, pipe, bg, extent,
+                                       dataset.sh_degree, args.recon_iters, args.lambda_depth)
+        rc.freeze(static)
+        if args.static_ply:
+            static.save_ply(args.static_ply)
+            print("static map cached ->", args.static_ply)
 
     # --- SMPL source: one params dict per timestep ---
     frames = resolve_frames(TS, args.smpl_root, args.behave_frames, args.n_select,
@@ -305,7 +313,7 @@ def render_sequence(args):
     except ImportError:
         imageio = None
 
-    per_psnr, root_traj, vframes = [], [], []
+    per_psnr, root_traj, vframes, oframes = [], [], [], []
     for ti, frame in valid:
         verts, pelvis = get_person_verts(frame, args)
         verts = align_to_scene(verts, t=args.align_t, s=args.align_s)
@@ -326,10 +334,13 @@ def render_sequence(args):
         if imageio is not None:
             imageio.imwrite(f"{args.out}/frames/ts{ti:03d}.png", (comp_np * 255).astype(np.uint8))
             vframes.append((np.concatenate([gt_np, comp_np], 1) * 255).astype(np.uint8))
+            oframes.append((comp_np * 255).astype(np.uint8))
         print(f"ts {ti:03d} | person-PSNR {per_psnr[-1]:.2f}")
 
     if imageio is not None and vframes:
         imageio.mimwrite(f"{args.out}/sequence.mp4", vframes, fps=args.fps, macro_block_size=None)
+        # render-only video: mesh on the STATIC scene, no GT panel -> no real person anywhere
+        imageio.mimwrite(f"{args.out}/overlay.mp4", oframes, fps=args.fps, macro_block_size=None)
 
     root_traj = np.stack(root_traj)
     np.save(f"{args.out}/root_traj.npy", root_traj)
@@ -404,6 +415,8 @@ def main():
     p.add_argument("--force_smplx", action="store_true",
                    help="pose GT via smplx params even if a person.ply mesh exists (needs --smpl_model_dir)")
     p.add_argument("--view", type=int, default=0, help="which of the 4 cameras to render from")
+    p.add_argument("--static_ply", default=None, help="static-map PLY cache: load if it exists, else "
+                   "reconstruct and save there (share with surfel_avatar's cache)")
     p.add_argument("--n_static", type=int, default=4)
     p.add_argument("--recon_iters", type=int, default=7000)
     p.add_argument("--lambda_depth", type=float, default=1.0)

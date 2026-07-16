@@ -132,13 +132,19 @@ def frame_transforms(model, J_rest, full_pose):
 
 
 # ============================================================================= canonical surfel sampling
-def sample_body_surface(v_shaped, faces, lbs_weights, n, detail_boost=0.3):
-    """Densely sample the rest body surface -> (P(n,3), skin_weights(n,Jn), normals(n,3)) numpy.
+def sample_body_surface(v_shaped, faces, lbs_weights, n, detail_boost=0.3,
+                        shell_frac=0.25, shell_max=0.04):
+    """Densely sample the rest body surface -> (P, skin_weights, normals) numpy (>=n points).
 
     Barycentric sampling; probability = (1-detail_boost)*area-weighted + detail_boost*uniform-per-
     TRIANGLE. Pure area weighting starves the face/hands (small area but finely tessellated — SMPL-X
     puts a huge share of its triangles there ON PURPOSE); the uniform-per-triangle term re-concentrates
     samples where the template wants detail, recovering v1/v2's per-vertex face density.
+
+    SHELLS (GHG-style): ``shell_frac`` of the samples are duplicated at a FIXED offset along the
+    normal, up to ``shell_max`` m — frozen off-body layers that cover hair/shoes/clothing volume the
+    naked SMPL surface can't reach. Opacity (trainable) decides which shell surfels survive; position
+    freedom (the 'offset' bind mode) measurably blurred, shells cover without moving.
     """
     v = v_shaped.detach().cpu().numpy()
     W = lbs_weights.detach().cpu().numpy()
@@ -156,6 +162,13 @@ def sample_body_surface(v_shaped, faces, lbs_weights, n, detail_boost=0.3):
     fv = faces[fidx]                                                                   # (n,3) vertex ids
     skin = (bar[:, :, None] * W[fv]).sum(1)                                            # (n,Jn)
     nrm = fn[fidx] / (np.linalg.norm(fn[fidx], axis=1, keepdims=True) + 1e-9)
+    if shell_frac > 0 and shell_max > 0:
+        m = int(n * shell_frac)
+        sel = np.random.choice(n, m, replace=False)
+        off = np.random.uniform(0.005, shell_max, size=(m, 1))
+        P = np.concatenate([P, P[sel] + nrm[sel] * off], 0)
+        skin = np.concatenate([skin, skin[sel]], 0)
+        nrm = np.concatenate([nrm, nrm[sel]], 0)
     return P.astype(np.float32), skin.astype(np.float32), nrm.astype(np.float32)
 
 
@@ -340,7 +353,8 @@ def train_avatar(args):
     body_slice = slice(3, 3 + 63)                                                      # 21 body joints
 
     # --- canonical surfels: dense surface samples, ΔR init from surface normal, scale TRAINABLE ---
-    Pc, skin0, nrm = sample_body_surface(v_shaped, faces, lbs_w, args.n_canon, args.detail_boost)
+    Pc, skin0, nrm = sample_body_surface(v_shaped, faces, lbs_w, args.n_canon, args.detail_boost,
+                                         args.shell_frac, args.shell_max)
     g = GaussianModel(dataset.sh_degree)
     g.create_from_pcd(BasicPointCloud(points=Pc.astype(np.float64),
                                       colors=np.full_like(Pc, 0.6, dtype=np.float64),
@@ -667,11 +681,16 @@ def main():
     p.add_argument("--body_prune", type=float, default=0.05, help="prune canonical surfels farther "
                    "than this (m) from the rest body (GauHuman's 0.05; hair/shoes need ~5cm — the "
                    "anchor reg, not this leash, is now the anti-drift mechanism); 0 = off")
-    p.add_argument("--bind", choices=["frozen", "offset", "free"], default="offset",
-                   help="canonical-position binding: 'frozen'=fixed ON the naked body (crisp but "
-                   "hair/shoes/hands unreachable -> extremity holes); 'offset'=reduced-lr xyz + L2 "
-                   "anchor to the body (GaussianAvatars-style; grows hair/clothing without blur); "
-                   "'free'=unconstrained (blurs under pose misregistration)")
+    p.add_argument("--bind", choices=["frozen", "offset", "free"], default="frozen",
+                   help="canonical-position binding: 'frozen'=fixed positions (crisp; extremity "
+                   "coverage comes from --shell_frac layers, not mobility); 'offset'=anchored "
+                   "trainable xyz (MEASURED to blur-relapse at lambda_anchor 10: 11.85 vs frozen "
+                   "13.27 dB); 'free'=unconstrained (blurs)")
+    p.add_argument("--shell_frac", type=float, default=0.25, help="fraction of extra canonical "
+                   "samples duplicated at fixed offsets along the normal (GHG shells — frozen "
+                   "off-body layers for hair/shoes/clothing); 0 = off")
+    p.add_argument("--shell_max", type=float, default=0.04, help="max shell offset (m); keep "
+                   "< --body_prune")
     p.add_argument("--xyz_lr_mul", type=float, default=0.25, help="offset mode: xyz lr multiplier")
     p.add_argument("--lambda_anchor", type=float, default=10.0, help="offset mode: L2 pull back to "
                    "the body surface (10 => ~3cm offsets cost ~9e-3 loss — hair/shoe scale allowed)")

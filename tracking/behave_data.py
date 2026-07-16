@@ -52,10 +52,26 @@ def load_timesteps(conv_root, dataset):
     return TS, PMASK, extent
 
 
-def keep_mask(PMASK, ti, cam, want):
-    """'person' -> the person mask; 'static' -> its complement (everything but the person)."""
+def keep_mask(PMASK, ti, cam, want, pad=0):
+    """'person' -> the person mask; 'static' -> its complement (everything but the person).
+
+    ``pad`` (px) optionally dilates the person mask before complementing — a safety margin against
+    mask undersegmentation bleeding person pixels into static supervision (precaution, off by
+    default; no such bleed has actually been confirmed in the BEHAVE masks).
+    """
     pm = PMASK[(ti, cam.image_name)]
-    return pm if want == "person" else (1.0 - pm)
+    if want == "person":
+        return pm
+    if pad > 0:
+        k = 2 * int(pad) + 1
+        pm = torch.nn.functional.max_pool2d(pm[None], k, stride=1, padding=int(pad))[0]
+    return 1.0 - pm
+
+
+def fuse_region_pad(want, pad=None):
+    """Default: no dilation. (The pad mechanism exists in case mask-undersegmentation bleed into the
+    static map is ever actually observed — it was once suspected and turned out to be a misreading.)"""
+    return 0 if pad is None else pad
 
 
 def backproject(cam, keep):
@@ -82,15 +98,17 @@ def backproject(cam, keep):
     return world, img[:, valid].T.cpu().numpy()
 
 
-def fuse_region(TS, PMASK, tis, want, cap=300000):
+def fuse_region(TS, PMASK, tis, want, cap=300000, pad=None):
     """Back-project ``want`` across all 4 views of every timestep in ``tis`` -> (points, colours).
 
     Also returns the list of (camera, keep_mask) views for reconstruction supervision.
+    ``pad``: person-mask dilation in px (default 12 for 'static', 0 for 'person' — see keep_mask).
     """
+    pad = fuse_region_pad(want, pad)
     pts, cols, views = [], [], []
     for ti in tis:
         for cam in TS[ti]["cams"]:
-            k = keep_mask(PMASK, ti, cam, want)
+            k = keep_mask(PMASK, ti, cam, want, pad)
             w, c = backproject(cam, k)
             pts.append(w); cols.append(c); views.append((cam, k))
     pts = np.concatenate(pts); cols = np.concatenate(cols)
