@@ -132,19 +132,22 @@ def frame_transforms(model, J_rest, full_pose):
 
 
 # ============================================================================= canonical surfel sampling
+# SMPL-X joints whose regions get shells: neck, head (hair) + ankles, feet (shoes)
+SHELL_JOINTS = (12, 15, 7, 8, 10, 11)
+
+
 def sample_body_surface(v_shaped, faces, lbs_weights, n, detail_boost=0.3,
                         shell_frac=0.25, shell_max=0.04):
-    """Densely sample the rest body surface -> (P, skin_weights, normals) numpy (>=n points).
+    """Densely sample the rest body surface -> (P, skin_weights, normals, is_shell) numpy.
 
-    Barycentric sampling; probability = (1-detail_boost)*area-weighted + detail_boost*uniform-per-
-    TRIANGLE. Pure area weighting starves the face/hands (small area but finely tessellated — SMPL-X
-    puts a huge share of its triangles there ON PURPOSE); the uniform-per-triangle term re-concentrates
-    samples where the template wants detail, recovering v1/v2's per-vertex face density.
-
-    SHELLS (GHG-style): ``shell_frac`` of the samples are duplicated at a FIXED offset along the
-    normal, up to ``shell_max`` m — frozen off-body layers that cover hair/shoes/clothing volume the
-    naked SMPL surface can't reach. Opacity (trainable) decides which shell surfels survive; position
-    freedom (the 'offset' bind mode) measurably blurred, shells cover without moving.
+    - ``n`` samples area-weighted over the surface, PLUS ``n*detail_boost`` EXTRA samples uniform-
+      per-TRIANGLE (concentrates on the finely-tessellated face/hands). Additive on purpose:
+      redistributing the same budget starved the large low-tessellation regions (legs — measured
+      regression in v3_6k_mamma_shells).
+    - SHELLS: duplicates of head/feet-region samples (SHELL_JOINTS skinning weight > 0.3) at FIXED
+      0.5cm..shell_max offsets along the normal — candidate layers for hair/shoes ONLY (whole-body
+      shells at high opacity occluded the skin and inflated the torso — measured). The caller inits
+      shells nearly TRANSPARENT (earn-your-existence) via the returned ``is_shell`` mask.
     """
     v = v_shaped.detach().cpu().numpy()
     W = lbs_weights.detach().cpu().numpy()
@@ -152,24 +155,30 @@ def sample_body_surface(v_shaped, faces, lbs_weights, n, detail_boost=0.3,
     e1, e2 = tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]
     fn = np.cross(e1, e2)
     area = 0.5 * np.linalg.norm(fn, axis=1) + 1e-12
-    p = (1.0 - detail_boost) * (area / area.sum()) + detail_boost / len(faces)
-    fidx = np.random.choice(len(faces), size=n, p=p / p.sum())
-    r1, r2 = np.random.rand(n, 1), np.random.rand(n, 1)
+    n_det = int(n * detail_boost)
+    fidx = np.concatenate([np.random.choice(len(faces), size=n, p=area / area.sum()),
+                           np.random.choice(len(faces), size=n_det)]) if n_det > 0 else \
+        np.random.choice(len(faces), size=n, p=area / area.sum())
+    nt = len(fidx)
+    r1, r2 = np.random.rand(nt, 1), np.random.rand(nt, 1)
     s = np.sqrt(r1)
     b0, b1, b2 = (1 - s), s * (1 - r2), s * r2                                         # barycentric
-    bar = np.concatenate([b0, b1, b2], 1)                                              # (n,3)
+    bar = np.concatenate([b0, b1, b2], 1)                                              # (nt,3)
     P = (bar[:, :, None] * tri[fidx]).sum(1)
-    fv = faces[fidx]                                                                   # (n,3) vertex ids
-    skin = (bar[:, :, None] * W[fv]).sum(1)                                            # (n,Jn)
+    fv = faces[fidx]                                                                   # (nt,3) vertex ids
+    skin = (bar[:, :, None] * W[fv]).sum(1)                                            # (nt,Jn)
     nrm = fn[fidx] / (np.linalg.norm(fn[fidx], axis=1, keepdims=True) + 1e-9)
+    is_shell = np.zeros(len(P), dtype=bool)
     if shell_frac > 0 and shell_max > 0:
-        m = int(n * shell_frac)
-        sel = np.random.choice(n, m, replace=False)
-        off = np.random.uniform(0.005, shell_max, size=(m, 1))
+        elig = np.where(skin[:, list(SHELL_JOINTS)].sum(1) > 0.3)[0]                   # head/feet regions
+        m = min(len(elig), int(nt * shell_frac))
+        sel = np.random.choice(elig, m, replace=False) if m < len(elig) else elig
+        off = np.random.uniform(0.005, shell_max, size=(len(sel), 1))
         P = np.concatenate([P, P[sel] + nrm[sel] * off], 0)
         skin = np.concatenate([skin, skin[sel]], 0)
         nrm = np.concatenate([nrm, nrm[sel]], 0)
-    return P.astype(np.float32), skin.astype(np.float32), nrm.astype(np.float32)
+        is_shell = np.concatenate([is_shell, np.ones(len(sel), dtype=bool)])
+    return (P.astype(np.float32), skin.astype(np.float32), nrm.astype(np.float32), is_shell)
 
 
 def nearest_vertex_weights(xyz, v_shaped, lbs_weights):
@@ -353,15 +362,22 @@ def train_avatar(args):
     body_slice = slice(3, 3 + 63)                                                      # 21 body joints
 
     # --- canonical surfels: dense surface samples, ΔR init from surface normal, scale TRAINABLE ---
-    Pc, skin0, nrm = sample_body_surface(v_shaped, faces, lbs_w, args.n_canon, args.detail_boost,
-                                         args.shell_frac, args.shell_max)
+    Pc, skin0, nrm, is_shell = sample_body_surface(v_shaped, faces, lbs_w, args.n_canon,
+                                                   args.detail_boost, args.shell_frac, args.shell_max)
+    print(f"canonical: {len(Pc)} samples ({int(is_shell.sum())} head/feet shell candidates)")
     g = GaussianModel(dataset.sh_degree)
     g.create_from_pcd(BasicPointCloud(points=Pc.astype(np.float64),
                                       colors=np.full_like(Pc, 0.6, dtype=np.float64),
                                       normals=nrm.astype(np.float64)), spatial_lr_scale=extent)
     with torch.no_grad():
         g._rotation.data = torch.tensor(normals_to_quats(nrm), device="cuda")          # residual-rot prior
-        g._opacity.data = g.inverse_opacity_activation(0.9 * torch.ones_like(g.get_opacity)).detach()  # solid, like the grey render (0.95)
+        # skin starts SOLID (grey-render crispness); shells start nearly TRANSPARENT — a 0.9-opacity
+        # shell in front of the skin occludes it and the optimizer must fight it down (measured:
+        # inflated marshmallow torso). Shells earn opacity only where hair/shoes need them.
+        op0 = torch.where(torch.tensor(is_shell, device="cuda")[:, None],
+                          torch.full_like(g.get_opacity, 0.1),
+                          torch.full_like(g.get_opacity, 0.9))
+        g._opacity.data = g.inverse_opacity_activation(op0).detach()
     g.active_sh_degree = g.max_sh_degree
     g.training_setup(opt)                                                              # xyz/scale/rot/SH/opac/sem
     # BINDING modes (the pendulum, one artifact each): 'free' xyz -> optimizer spreads surfels to
