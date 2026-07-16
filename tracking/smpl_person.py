@@ -199,7 +199,10 @@ def get_person_verts(frame_dir, args):
             d = np.load(hits[0], allow_pickle=True)
             if "vertices" in d:
                 v = np.asarray(d["vertices"], dtype=np.float64)
-                return v, v.mean(0)
+                # root = MAMMA's global translation (stable) if present, else mesh centroid (jitters
+                # with limb swing -> bad for Part B trajectory). render still uses the mesh (v).
+                root = np.asarray(d["transl"], dtype=np.float64).reshape(3) if "transl" in d else v.mean(0)
+                return v, root
     loader = load_mamma_smpl if args.smpl_source == "mamma" else load_behave_smpl
     params = loader(frame_dir)
     mtype = params.get("model_type", "smplx" if args.smpl_source == "mamma" else "smplh")

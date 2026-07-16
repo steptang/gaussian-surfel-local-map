@@ -22,6 +22,19 @@ import argparse
 import numpy as np
 
 
+def smooth_traj(traj, w):
+    """Centred moving-average per axis (w frames). w<=1 is a no-op. Tames per-frame estimation jitter."""
+    if w <= 1:
+        return traj
+    k = np.ones(w) / w
+    pad = w // 2
+    out = np.empty_like(traj)
+    for i in range(traj.shape[1]):
+        pp = np.pad(traj[:, i], pad, mode="edge")
+        out[:, i] = np.convolve(pp, k, mode="same")[pad:pad + len(traj)]
+    return out
+
+
 def ground_axes(traj):
     """Pick the two ground-plane axes (highest variance) + the ~vertical axis (lowest variance).
 
@@ -116,12 +129,15 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--hist", type=int, default=8)
     p.add_argument("--horizon", type=int, default=8)
+    p.add_argument("--smooth", type=int, default=1, help="moving-average window over the trajectory (1=off)")
     a = p.parse_args()
 
     traj = np.load(a.root_traj)
     assert traj.ndim == 2 and traj.shape[1] == 3, f"expected (T,3), got {traj.shape}"
+    traj = smooth_traj(traj, a.smooth)
     os.makedirs(a.out, exist_ok=True)
     res, axes = evaluate(traj, a.hist, a.horizon)
+    res["smooth"] = a.smooth
     json.dump(res, open(f"{a.out}/prediction.json", "w"), indent=2)
     plot(traj, axes, f"{a.out}/trajectory.png", a.hist, a.horizon)
     print(json.dumps(res, indent=2))
