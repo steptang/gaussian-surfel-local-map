@@ -434,6 +434,12 @@ def train_avatar(args):
             print(f"rigid_correct: {len(errs)} frames | mean err re-pose->pred_vertices "
                   f"{np.mean([e for _, e, _ in errs])*100:.1f}cm -> corrected "
                   f"{np.mean([e for _, _, e in errs])*100:.1f}cm (worst ts {worst[0]}: {worst[2]*100:.1f}cm)")
+        else:
+            # burned two runs on a silent skip (params-only exports from the bad world2cam attempt)
+            print("!!! rigid_correct: NO 'vertices' in any export under --smpl_root -> NO correction "
+                  "applied; frame-convention errors will NOT be fixed. Point --smpl_root at the "
+                  "*_cam2world exports (behave_to_mamma output writes 'vertices' when MAMMA's "
+                  "verts_joints npz is present).")
 
     # --- geometric sanity BEFORE appearance training: grey posed body composited at 3 frames ---
     show0 = sorted({valid[0][0], valid[len(valid) // 2][0], valid[-1][0]})
