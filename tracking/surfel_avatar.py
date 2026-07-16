@@ -114,7 +114,7 @@ def canonical_shape(model, betas):
     shapedirs = model.shapedirs[..., :b.shape[1]]
     v_shaped = model.v_template[None].cuda() + blend_shapes(b, shapedirs.cuda())      # (1,V,3)
     J = vertices2joints(model.J_regressor.cuda(), v_shaped)                            # (1,Jn,3)
-    return v_shaped[0], J
+    return v_shaped[0], J[0]                       # drop batch dims: (V,3), (Jn,3) as documented
 
 
 def frame_transforms(model, J_rest, full_pose):
