@@ -192,6 +192,14 @@ def get_person_verts(frame_dir, args):
         if mp is not None:
             v = load_ply_verts(mp)
             return v, v.mean(0)
+    if args.smpl_source == "mamma" and not args.force_smplx:
+        # prefer MAMMA's exported posed mesh (pred_vertices) -> render directly, no smplx re-posing
+        hits = glob.glob(f"{frame_dir}/*.npz")
+        if hits:
+            d = np.load(hits[0], allow_pickle=True)
+            if "vertices" in d:
+                v = np.asarray(d["vertices"], dtype=np.float64)
+                return v, v.mean(0)
     loader = load_mamma_smpl if args.smpl_source == "mamma" else load_behave_smpl
     params = loader(frame_dir)
     mtype = params.get("model_type", "smplx" if args.smpl_source == "mamma" else "smplh")

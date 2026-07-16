@@ -162,11 +162,25 @@ def mamma_to_exports(mamma_out_dir, exports_root):
     transl = np.asarray(d["smplx_translation"], dtype=np.float32)   # (T,3)
     betas = np.asarray(d["smplx_betas"], dtype=np.float32).reshape(-1)   # (16,), shared
     T = pose.shape[0]
+
+    # MAMMA's posed mesh (verts_joints_body_id-*.npz -> pred_vertices (T,10475,3)) — render these
+    # DIRECTLY (no smplx re-posing / no betas-truncation), like Part A's person.ply.
+    verts = None
+    vfiles = sorted(glob.glob(f"{os.path.dirname(files[0])}/verts_joints_body_id-*.npz"))
+    if vfiles:
+        vd = dict(np.load(vfiles[0], allow_pickle=True))
+        vkey = next((k for k in ("pred_vertices", "vertices") if k in vd), None)
+        if vkey:
+            verts = np.asarray(vd[vkey], dtype=np.float32)          # (T,10475,3)
+            print(f"using MAMMA posed mesh '{vkey}' {verts.shape} (render verts directly)")
+
     for i in range(T):
         fd = f"{exports_root}/frame_{i:05d}"; os.makedirs(fd, exist_ok=True)
-        np.savez(f"{fd}/mamma.npz",
-                 global_orient=pose[i, :3], body_pose=pose[i, 3:66],
-                 betas=betas, transl=transl[i], gender="neutral", model_type="smplx")
+        out = dict(global_orient=pose[i, :3], body_pose=pose[i, 3:66],
+                   betas=betas, transl=transl[i], gender="neutral", model_type="smplx")
+        if verts is not None and i < len(verts):
+            out["vertices"] = verts[i]                              # (10475,3), preferred by the renderer
+        np.savez(f"{fd}/mamma.npz", **out)
     print(f"wrote {T} per-frame exports -> {exports_root}/frame_*/mamma.npz")
     return T
 
