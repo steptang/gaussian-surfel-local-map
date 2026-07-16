@@ -23,6 +23,23 @@ import argparse
 import numpy as np
 
 
+def load_faces(args):
+    """Body-mesh faces (F,3): mamma -> from the SMPL-X model files; gt -> off a BEHAVE person.ply."""
+    if args.smpl_source == "mamma":
+        import smplx
+        assert args.smpl_model_dir, "mamma faces need --smpl_model_dir"
+        m = smplx.create(args.smpl_model_dir, model_type="smplx", use_pca=False, batch_size=1)
+        return np.asarray(m.faces, dtype=np.int64)
+    import glob
+    import trimesh
+    import tracking.smpl_person as sp
+    for ts in sorted(glob.glob(f"{args.smpl_root}/t*.000")):
+        mp = sp.find_person_mesh(ts)
+        if mp:
+            return np.asarray(trimesh.load(mp, process=False).faces, dtype=np.int64)
+    raise FileNotFoundError("no person.ply to read faces from")
+
+
 def cam_intrinsics(cam):
     """Pinhole (fx, fy, cx, cy) from a fork camera (same convention as behave_data.backproject)."""
     W, H = cam.image_width, cam.image_height
@@ -78,7 +95,6 @@ def main():
     import imageio.v2 as imageio
     import tracking.behave_data as bd
     import tracking.smpl_person as sp
-    import tracking.surfel_avatar as sa
     from gaussian_renderer import render, GaussianModel
 
     os.makedirs(f"{args.out}/frames", exist_ok=True)
@@ -105,7 +121,7 @@ def main():
         verts, _ = sp.get_person_verts(frame, args)
         verts = sp.align_to_scene(verts, t=args.align_t, s=args.align_s)
         if faces is None:
-            faces = sa.load_faces(args, len(verts))
+            faces = load_faces(args)
 
         cam = TS[ti]["cams"][args.view]
         with torch.no_grad():
